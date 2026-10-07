@@ -8,4 +8,3 @@
 
 ## Log
 <!-- newest at the bottom; GARVIS appends with a timestamp -->
-- 2026-10-07 18:24 - self-test at 2026-10-07 18:24:53

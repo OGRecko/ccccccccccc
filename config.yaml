@@ -132,9 +132,12 @@ permissions:
   # Actions whose tier is decided by name pattern rather than the tool's
   # declared default (checked in order, first match wins).
   rules:
-    - {tier: green,  match: "^(files\\.(read|list|stat)|shell\\.(which)|browser\\.(read|screenshot)|screen\\.|memory\\.read|apps\\.list|time\\.)"}
-    - {tier: yellow, match: "^(files\\.(write|move|copy)|shell\\.run|apps\\.(open|close)|browser\\.(click|type|goto|open|submit))"}
-    - {tier: red,    match: "^(files\\.delete|shell\\.sudo|browser\\.(login|payment|purchase)|system\\.)"}
+    # Opening and reading a site is a read action (GREEN): it cannot change
+    # anything the allowlist does not already permit. Clicking, typing, pressing
+    # keys and closing profiles all need a confirmation.
+    - {tier: green,  match: "^(files\\.(read|list|search|stat)|shell\\.(which|info)|browser\\.(read|screenshot|profiles|status|open|goto)|memory\\.read|apps\\.list|clock\\.|activity\\.|assistant\\.(about|list_capabilities|stop))"}
+    - {tier: yellow, match: "^(files\\.(write|mkdir|move|copy)|shell\\.run|apps\\.open|browser\\.(click|type|press|close|continue)|memory\\.(note|set_profile_field)|assistant\\.set_personality)"}
+    - {tier: red,    match: "^(files\\.delete|apps\\.close|shell\\.sudo|browser\\.(login|payment|purchase)|system\\.)"}
   # Extra keywords that force RED even if a rule says otherwise.
   red_keywords: [sudo, admin, rm -rf, del /f, format, mkfs, diskpart, shutdown,
                  regedit, chmod 777, chown, passwd, ssh-key, keychain,
@@ -241,11 +244,18 @@ browser:
                binance.com, wise.com, revolut.com, stripe.com]
   action_timeout_s: 15
   navigation_timeout_s: 30
-  slow_mo_ms: 0
+  slow_mo_ms: 0                  # e.g. 100 to make automation visibly slower
+  max_open_profiles: 3           # older profiles are closed to respect this cap
+  screenshot_full_page: true
+  auto_start: true               # launch Chromium on the first browser tool call
+  # Detected on every action; a hit stops automation for that profile until you
+  # finish the human step and say "continue". GARVIS never solves these itself.
   human_takeover:
-    detect_captcha: true         # stop and hand back control on CAPTCHA
-    detect_2fa: true             # stop on OTP/2FA prompts
-    detect_botblock: true        # "unusual traffic", "verify you are human", 429/403 walls
+    detect_captcha: true         # "I'm not a robot", hCaptcha/Turnstile widgets
+    detect_2fa: true             # OTP / 2FA / "we sent you a code" prompts
+    detect_botblock: true        # "unusual traffic", "access denied", 403/429 walls
+    detect_login: true           # login walls also hand over: you log in, not GARVIS
+    detect_consent: false        # cookie walls: often harmless, off by default
     wait_for_human_s: 300        # how long GARVIS waits while you take over
   never_auto_submit: true        # typing is allowed, hitting Send/Pay is not (RED)
   screenshots_dir: logs/browser_shots

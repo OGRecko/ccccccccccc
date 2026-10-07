@@ -109,6 +109,7 @@ class Garvis:
         self.services["registry"] = self.registry
         self.services["notifier"] = self.notify
         self.setup_voice()
+        self.setup_browser()
         self.services["notifier"] = self.notify
         self.gate = self._build_gate()
         self.services["gate"] = self.gate
@@ -226,6 +227,26 @@ class Garvis:
         except Exception as exc:
             self.log.error("voice input failed to initialise: %s", exc)
 
+    def setup_browser(self) -> None:
+        """Create the browser manager (the browser itself starts on first use)."""
+        if not self.cfg.get("browser.enabled", True):
+            self.log.info("browser control disabled in config")
+            return
+        try:
+            from core.browser import BrowserManager
+
+            manager = BrowserManager(
+                self.cfg,
+                activity=self.activity,
+                log=self.log,
+                notify=self.notify,
+            )
+            self.services["browser"] = manager
+            self.log.info("browser manager ready (%s)", manager.describe())
+        except Exception as exc:
+            self.log.error("browser manager failed to initialise: %s", exc)
+            self.services["browser"] = None
+
     def _on_speaking(self, text: str) -> None:
         """Called by TTS when an utterance actually starts."""
         if self.cfg.get("logging.level") == "DEBUG":
@@ -253,6 +274,16 @@ class Garvis:
                     tts.pause()     # and refuse new speech until resume
                 except Exception:
                     self.log.debug("tts stop failed", exc_info=True)
+            browser = self.services.get("browser")
+            if browser is not None and hasattr(browser, "halt_all"):
+                try:
+                    # Nothing may continue on a page after a stop: every open
+                    # profile is handed back and needs an explicit "continue".
+                    halted = browser.halt_all(f"stop everything: {event.reason}")
+                    if halted:
+                        self.log.warning("kill switch halted browser profiles: %s", ", ".join(halted))
+                except Exception:
+                    self.log.debug("browser halt failed", exc_info=True)
             ui = self.services.get("ui")
             if ui is not None and hasattr(ui, "set_status"):
                 try:
@@ -726,6 +757,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="report TTS/STT/wake-word status and exit")
     parser.add_argument("--say", metavar="TEXT", default=None, help="speak one phrase through the TTS engine")
     parser.add_argument("--devices", action="store_true", help="list audio devices and exit")
+    parser.add_argument("--browser-check", action="store_true",
+                        help="start the browser, report profiles and rules, then exit")
     parser.add_argument("--log-level", default=None, help="DEBUG|INFO|WARNING|ERROR")
     parser.add_argument("--version", action="version", version=f"GARVIS {VERSION}")
     return parser
@@ -785,6 +818,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.check:
         print(describe(cfg))
         print()
+        manager = app.services.get("browser")
+        if manager is not None:
+            print(manager.describe())
+            print()
         print("Tools registered:")
         for category, tools in sorted(app.registry.by_category().items()):
             names = ", ".join(f"{t.name}[{t.tier}]" for t in tools)
@@ -801,6 +838,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.voice_check:
         return voice_check(app)
+
+    if args.browser_check:
+        return browser_check(app)
 
     if args.say:
         tts = app.services.get("tts")
@@ -838,6 +878,35 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         app.running = False
         app.shutdown()
+
+
+def browser_check(app: "Garvis") -> int:
+    """--browser-check: prove Chromium actually launches, with real profile paths."""
+    manager = app.services.get("browser")
+    print(f"{app.cfg.assistant_name} browser check")
+    print("-" * 60)
+    if manager is None:
+        print("browser: disabled in config.yaml (browser.enabled = false)")
+        return 0
+
+    started = manager.start()
+    print(f"driver : {started.message}")
+    status = manager.status()
+    if status.ok:
+        data = status.data
+        print(f"engine : {data.get('driver')}")
+        print(f"allowed sites : {', '.join(data.get('allowed_sites') or []) or '(none)'}")
+        print(f"never automated: {', '.join(data.get('blocked_sites') or []) or '(none)'}")
+    profiles = manager.list_profiles()
+    print(f"profiles ({manager.profiles_dir}): {', '.join(p['label'] for p in profiles) or 'none yet'}")
+    manager.shutdown()
+    print("-" * 60)
+    if started.ok:
+        print("RESULT: browser ready")
+        return 0
+    print("RESULT: browser NOT ready - install Chromium for Playwright with:")
+    print("        pip install playwright && playwright install chromium")
+    return 1
 
 
 def voice_check(app: "Garvis") -> int:

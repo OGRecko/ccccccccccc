@@ -102,6 +102,11 @@ class Tool:
     example: str | None = None
     #: Args hidden from logs (never secrets; the gate refuses those anyway).
     log_omit: tuple[str, ...] = ()
+    #: Args whose *values* may be secrets (a password someone tried to type).
+    #: They are replaced by "[hidden]" in every log line, the confirmation
+    #: summary and the spoken challenge, so a secret can never be written down
+    #: even when the call is refused.
+    secret_args: tuple[str, ...] = ()
 
     def run(self, args: dict[str, Any]) -> ToolResult:
         """Call the underlying function, normalising return values.
@@ -149,7 +154,7 @@ class Tool:
             return self.name
         parts = []
         for key, value in args.items():
-            if key in self.log_omit:
+            if key in self.log_omit or key in self.secret_args:
                 value = "[hidden]"
             text = str(value).replace("\n", " ")
             if len(text) > limit:
@@ -205,6 +210,7 @@ class ToolRegistry:
         timeout_s: float | None = None,
         example: str | None = None,
         log_omit: tuple[str, ...] = (),
+        secret_args: tuple[str, ...] = (),
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Decorator form: ``@registry.tool(name=..., tier=GREEN)``."""
 
@@ -227,6 +233,7 @@ class ToolRegistry:
                     timeout_s=timeout_s,
                     example=example,
                     log_omit=log_omit,
+                    secret_args=secret_args,
                 )
             )
             return func

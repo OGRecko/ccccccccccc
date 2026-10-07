@@ -540,6 +540,19 @@ class PermissionGate:
             )
         self.log_info("added %s confirmation channel", confirmer.name)
 
+    def _log_args(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Arguments as they may be written down: declared secrets are hidden.
+
+        ``secret_args`` (e.g. the text about to be typed into a web field) and
+        ``log_omit`` are replaced by "[hidden]". Nothing else is touched, so the
+        activity log stays useful for "what did you do today".
+        """
+        tool = self.registry.get(tool_name) if self.registry is not None else None
+        hidden = set(getattr(tool, "log_omit", ()) or ()) | set(getattr(tool, "secret_args", ()) or ())
+        if not hidden or not args:
+            return args
+        return {key: ("[hidden]" if key in hidden else value) for key, value in args.items()}
+
     # -- logging shims -----------------------------------------------------
     def log_info(self, message: str, *args: Any) -> None:
         if self.log:
@@ -862,8 +875,8 @@ class PermissionGate:
                     display="aborted after repeated failures",
                 )
                 outcome.duration_ms = (time.perf_counter() - started) * 1000
-                self._record(tool=tool_name, args=args, tier=RED, decision=ABORTED,
-                             note="consecutive failure limit reached")
+                self._record(tool=tool_name, args=self._log_args(tool_name, args), tier=RED,
+                             decision=ABORTED, note="consecutive failure limit reached")
                 self.stats[ABORTED] += 1
                 self._notify("I have failed several times in a row, so I stopped. Please check.")
                 return outcome
@@ -928,14 +941,15 @@ class PermissionGate:
         # asked/confirmed/denied records from the confirmation step.
         if tier == GREEN:
             self._record(
-                tool=tool_name, args=args, tier=tier, decision=outcome.decision,
+                tool=tool_name, args=self._log_args(tool_name, args), tier=tier,
+                decision=outcome.decision,
                 note=(outcome.verified or (outcome.error or "")[:200] or ""),
                 sensitive=sensitive,
             )
         if self.activity is not None:
             try:
                 self.activity.tool_call(
-                    tool_name, {k: v for k, v in args.items() if k not in getattr(tool, "log_omit", ())},
+                    tool_name, self._log_args(tool_name, args),
                     result=(outcome.content or "")[:1500],
                     ok=outcome.ok,
                     duration_ms=outcome.duration_ms,
@@ -1094,7 +1108,7 @@ class PermissionGate:
             stage="single",
         )
         self._record(
-            tool=tool.name, args=args, tier=tier, decision="asked",
+            tool=tool.name, args=self._log_args(tool.name, args), tier=tier, decision="asked",
             note=" | ".join(reasons) if reasons else "", sensitive=sensitive,
         )
         self._notify(f"About to {human}. Say yes to approve.")
@@ -1127,7 +1141,7 @@ class PermissionGate:
                 sensitive=sensitive,
             )
             step1.challenge_spoken = _spoken_challenge(tool, args)
-            self._record(tool=tool.name, args=args, tier=RED, decision="asked",
+            self._record(tool=tool.name, args=self._log_args(tool.name, args), tier=RED, decision="asked",
                          note="RED step 1/2: repeat the exact action", sensitive=sensitive)
             self._notify(
                 f"This is a red action: {step1.challenge_spoken}. "
@@ -1145,7 +1159,7 @@ class PermissionGate:
                 )
             matched, why_not = step1.match_repeat(answer1.text)
             if not matched:
-                self._record(tool=tool.name, args=args, tier=RED, decision=DENIED,
+                self._record(tool=tool.name, args=self._log_args(tool.name, args), tier=RED, decision=DENIED,
                              note=f"RED step 1: repeated wording did not match ({why_not})",
                              sensitive=sensitive)
                 return ConfirmAnswer(
@@ -1159,7 +1173,7 @@ class PermissionGate:
             mode=str(cfg.get("mode", "both")), stage="confirm", require_phrase=require_phrase,
             sensitive=sensitive,
         )
-        self._record(tool=tool.name, args=args, tier=RED, decision="asked",
+        self._record(tool=tool.name, args=self._log_args(tool.name, args), tier=RED, decision="asked",
                      note="RED step 2/2: say the confirmation word", sensitive=sensitive)
         self._notify(
             f"Step two: say the word {require_phrase} if you really want this."
@@ -1175,14 +1189,14 @@ class PermissionGate:
                 note=f"RED step 2: no answer / refused{detail}",
             )
         if _norm(answer2.text) != _norm(require_phrase):
-            self._record(tool=tool.name, args=args, tier=RED, decision=DENIED,
+            self._record(tool=tool.name, args=self._log_args(tool.name, args), tier=RED, decision=DENIED,
                          note="RED step 2: confirmation word missing", sensitive=sensitive)
             return ConfirmAnswer(
                 False, method=method, text=answer2.text,
                 note=f"RED step 2: the word '{require_phrase}' was not given",
             )
 
-        self._record(tool=tool.name, args=args, tier=RED, decision=CONFIRMED,
+        self._record(tool=tool.name, args=self._log_args(tool.name, args), tier=RED, decision=CONFIRMED,
                      note="exact action repeated and confirmation word given", sensitive=sensitive)
         return ConfirmAnswer(True, method=method, text=answer2.text,
                              note="exact action repeated + confirmation word given")
@@ -1198,14 +1212,15 @@ class PermissionGate:
         )
         outcome.duration_ms = (time.perf_counter() - started) * 1000
         self.stats[decision] = self.stats.get(decision, 0) + 1
-        self._record(tool=tool, args=args, tier=tier, decision=decision, note=reason,
-                     sensitive=sensitive)
+        self._record(tool=tool, args=self._log_args(tool, args), tier=tier, decision=decision,
+                     note=reason, sensitive=sensitive)
         self.log_warning("DENIED %s (%s): %s", tool, tier, reason)
         if bool(self.cfg.get("permissions.spoken_denials", True)) and decision in (DENIED,):
             self._notify("That needs your approval, so I stopped.")
         if self.activity is not None:
             try:
-                self.activity.tool_call(tool, args, result=f"{decision}: {reason}", ok=False,
+                self.activity.tool_call(tool, self._log_args(tool, args),
+                                        result=f"{decision}: {reason}", ok=False,
                                         duration_ms=outcome.duration_ms, tier=tier,
                                         sensitive=sensitive)
             except Exception:

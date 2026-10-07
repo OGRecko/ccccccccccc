@@ -29,6 +29,7 @@ from core.browser import (
     SEND_WORDS,
     classify_click_target,
     looks_like_a_secret_field,
+    selector_names_a_secret,
     validate_label,
 )
 
@@ -84,16 +85,30 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
     def credential_refusal(selector: str, text: str, profile: str = "") -> str | None:
         """Never type secrets. Checked *before* the gate, so no approval can bypass it.
 
-        Two checks: the field's own attributes (type=password, name=otp, ...) and
-        the value about to be typed (a password-looking string, a long digit run).
+        Three checks, cheapest first, any one of which refuses:
+
+        1. the selector itself - ``#password``, ``input[name=otp]``, ``#card-number``.
+           This one always works: it needs no page and cannot fail open.
+        2. the field's real attributes from the page (type=password, autocomplete,
+           placeholder, aria-label ...) - the authoritative check when the page
+           can be read at all.
+        3. the value about to be typed (a password-looking string, a digit run).
+
+        A refusal here is only ever a "type it yourself, then tell me to continue",
+        so a false positive costs nothing; a miss would mean typing a credential.
         """
         manager = _manager(services)
-        if manager is None:
-            return None
-        try:
-            hints = manager.element_hints(_label(profile), selector)
-        except Exception:  # never let a hint lookup block a real refusal
-            hints = {}
+        if selector_names_a_secret(selector):
+            return (
+                f"Refused: the selector '{selector}' names a credential field. I never type "
+                f"passwords, codes or card numbers - please type it yourself, then tell me to continue."
+            )
+        hints: dict[str, str] = {}
+        if manager is not None:
+            try:
+                hints = manager.element_hints(_label(profile), selector) or {}
+            except Exception:  # never let a hint lookup block a real refusal
+                hints = {}
         hint_text = " ".join(f"{key}={value}" for key, value in (hints or {}).items())
         if looks_like_a_secret_field(hint_text):
             return (

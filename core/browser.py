@@ -199,6 +199,30 @@ _CARD_NUMBER_RE = re.compile(r"(?:\d[\s-]?){13,19}")
 _DIGIT_CODE_RE = re.compile(r"\b\d{1,2}[\s-]?digit")
 
 
+_SECRET_TOKENS = frozenset({
+    "password", "passwd", "pwd", "passphrase", "passcode", "pin", "otp", "totp",
+    "2fa", "mfa", "cvv", "cvc", "ssn", "iban", "secret", "token", "cardnumber",
+    "card_number",
+})
+_SECRET_PAIRS = (("card", "number"), ("credit", "card"), ("one", "time"),
+                 ("security", "code"), ("auth", "code"), ("sms", "code"))
+
+
+def selector_names_a_secret(selector: str) -> bool:
+    """True when the selector itself names a credential field.
+
+    Used as the always-available half of the password refusal: it needs no page,
+    so it cannot fail open the way a live DOM lookup can. Matching is by whole
+    token, so ``#spinner`` and ``#shipping-address`` are *not* treated as PIN
+    fields, while ``#card-number`` and ``input[type=password]`` are.
+    """
+    tokens = [token for token in re.split(r"[^a-z0-9]+", str(selector or "").lower()) if token]
+    if any(token in _SECRET_TOKENS for token in tokens):
+        return True
+    pairs = set(zip(tokens, tokens[1:]))
+    return any(pair in pairs for pair in _SECRET_PAIRS)
+
+
 def looks_like_a_secret_field(hint: str) -> bool:
     """Decide whether a field is for a credential GARVIS must never fill."""
     text = str(hint or "").lower()

@@ -15,6 +15,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# tests/self_test.py is a runnable script (`python tests/self_test.py`), not a
+# pytest module: pytest would collect it just because the name ends in _test.py.
+collect_ignore = ["self_test.py"]
+
 from core.config import Config  # noqa: E402
 from core.logger import ActivityLogger, configure_activity_logger, setup_logging  # noqa: E402
 from core.memory import Memory  # noqa: E402

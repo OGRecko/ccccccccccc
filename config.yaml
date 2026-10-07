@@ -387,7 +387,10 @@ safety:
   screenshot_after_action: true  # verify state-changing actions (requirement 6)
   barge_in: true                 # speaking interrupts GARVIS mid-sentence
   startup_greeting: "Systems online. What are we doing?"
+  time_of_day_greeting: true     # prepend "Good morning, <user>." to the greeting
   daily_briefing: true           # on startup: today's log + pending state
+  briefing_max_lines: 4          # keep the wake-up short (1 = greeting only)
+  briefing_spoken: true          # speak it on startup; false = print only
 
 # ---------------------------------------------------------------------------
 # SELF TEST (stage 9)

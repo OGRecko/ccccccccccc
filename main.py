@@ -558,6 +558,137 @@ class Garvis:
             return True
         return False
 
+    def wake_up(self, quiet: bool = False) -> str:
+        """The startup routine: greet, brief, and say what is waiting.
+
+        Local and cheap on purpose - it has to work with the model down, because
+        that is exactly when being told something matters. Returns the text so
+        callers (and tests) can print, speak or check it.
+        """
+        cfg = self.cfg
+        greeting = str(cfg.get("safety.startup_greeting", "") or "").strip()
+        user = str(cfg.get("app.user_name", "") or "").strip()
+        name = str(cfg.get("app.name", "GARVIS") or "GARVIS")
+
+        lines: list[str] = []
+        if bool(cfg.get("safety.time_of_day_greeting", True)):
+            hour = time.localtime().tm_hour
+            part = "Good morning" if hour < 12 else ("Good afternoon" if hour < 18 else "Good evening")
+            opening = f"{part}{', ' + user if user else ''}."
+        else:
+            opening = f"Hello{', ' + user if user else ''}."
+        if greeting:
+            opening = f"{opening} {greeting}"
+        lines.append(opening)
+
+        max_lines = max(1, int(cfg.get("safety.briefing_max_lines", 4) or 4))
+
+        if bool(cfg.get("safety.daily_briefing", True)) and len(lines) < max_lines:
+            try:
+                brief = self.activity.today_report(limit=8)
+            except Exception as exc:
+                brief = ""
+                self.log.debug("could not read today's log: %s", exc)
+            # today_report is several lines; the spoken briefing gets the first one.
+            if brief and "Nothing logged yet today" not in brief:
+                lines.append(" ".join(brief.splitlines()[0].split()))
+
+        pending, current = self._unfinished_work()
+        if current is not None and len(lines) < max_lines:
+            lines.append(f"I am in the middle of: {current.description}")
+        elif pending is not None and len(lines) < max_lines:
+            lines.append(
+                f"Unfinished work from last time: {pending.description}. "
+                "Say 'resume' and I will carry on, or ask for the rollback plan."
+            )
+
+        problems = self._startup_problems()
+        if problems and len(lines) < max_lines:
+            lines.append(f"Heads up: {problems[0]}")
+
+        text = " ".join(lines)
+        try:
+            self.activity.event(
+                "wake",
+                text,
+                extra={
+                    "quiet": quiet,
+                    "personality": getattr(getattr(self, "brain", None), "personality", ""),
+                    "name": name,
+                },
+            )
+        except Exception:
+            # A broken log is not a reason to fail to say good morning.
+            self.log.debug("could not log the wake-up briefing", exc_info=True)
+        if quiet:
+            return text
+        if self._speak_briefing():
+            self.say(text, wait=False)
+        else:
+            print(f"\n{name}: {text}\n")
+        return text
+
+    def _unfinished_work(self) -> tuple[Any, Any]:
+        """(pending task, task in progress) from whatever the state store is now.
+
+        Every access is guarded: the wake-up routine runs before anything else,
+        so a half-built or broken service must degrade to "nothing to report"
+        rather than stop GARVIS from starting.
+        """
+        pending = getattr(self, "pending_resume", None)
+        current = None
+        try:
+            state = self.services.get("state")
+            if state is not None:
+                current = getattr(state, "current", None)
+                if pending is None:
+                    pending = getattr(state, "interrupted", None)
+        except Exception as exc:
+            self.log.debug("could not read the task state for the briefing: %s", exc)
+        return pending, current
+
+    def _speak_briefing(self) -> bool:
+        """True when the briefing should be spoken rather than printed."""
+        if not bool(self.cfg.get("safety.briefing_spoken", True)):
+            return False
+        tts = self.services.get("tts")
+        if tts is None or not getattr(tts, "enabled", False):
+            return False
+        # Only actually speak when there is a voice to speak with; otherwise
+        # print, so a missing engine is not reported as a TTS failure.
+        return bool(getattr(getattr(tts, "engine", None), "available", True))
+
+    def _startup_problems(self) -> list[str]:
+        """One-line reasons GARVIS is not fully itself, worst first."""
+        problems: list[str] = []
+        try:
+            return self._startup_problems_inner()
+        except Exception as exc:
+            self.log.debug("could not work out the startup problems: %s", exc)
+            return problems
+
+    def _startup_problems_inner(self) -> list[str]:
+        problems: list[str] = []
+        brain = getattr(self, "brain", None)
+        client = getattr(brain, "client", None)
+        if client is not None:
+            try:
+                if not client.is_up():
+                    problems.append(f"Ollama is not answering at {self.cfg.ollama_host}")
+                elif not client.has_model(self.cfg.model):
+                    problems.append(f"model {self.cfg.model} is not installed")
+            except Exception as exc:
+                problems.append(f"could not check Ollama ({exc})")
+        tts = self.services.get("tts")
+        if tts is None or not getattr(tts, "enabled", False):
+            problems.append("voice output is off, so I am printing instead of speaking")
+        elif not getattr(getattr(tts, "engine", None), "available", True):
+            problems.append("no text-to-speech engine is available")
+        listener = self.services.get("voice_in")
+        if listener is not None and not getattr(listener.mic, "available", True):
+            problems.append("the microphone is unavailable")
+        return problems
+
     def say(self, text: str, wait: bool = True) -> None:
         """Print and, from stage 5, also speak."""
         print(f"\n{self.cfg.assistant_name}: {text}\n")
@@ -809,6 +940,10 @@ class Garvis:
             min_chars=int(self.cfg.get("voice_out.min_chunk_chars", 12)),
             max_chars=int(self.cfg.get("voice_out.max_chunk_chars", 220)),
         )
+        try:
+            self.wake_up()
+        except Exception:
+            self.log.debug("wake-up routine failed", exc_info=True)
         print("Type a message. /help lists local commands.\n")
         while self.running:
             self._set_ui_status("listening", "waiting for you")
@@ -865,9 +1000,19 @@ class Garvis:
             self.killswitch.install_hotkey()
             self._shutdown_hotkey = True
 
-        greeting = str(self.cfg.get("safety.startup_greeting", "Systems online."))
+        # The startup routine greets, briefs and names pending work. The wake
+        # word reminder follows it, so the user always hears how to call GARVIS.
+        try:
+            brief = self.wake_up()
+        except Exception:
+            self.log.debug("wake-up routine failed", exc_info=True)
+            brief = str(self.cfg.get("safety.startup_greeting", "Systems online."))
         wake_name = str(self.cfg.get("app.wake_name", "Garvis"))
-        self.say(f"{greeting} Say '{wake_name}' when you need me.", wait=False)
+        self.say(
+            f"{brief} Say '{wake_name}' when you need me. "
+            f"Or say '{self.cfg.get('safety.kill_phrases', ['stop everything'])[0]}' and I stop instantly.",
+            wait=False,
+        )
 
         while self.running:
             try:
@@ -1005,6 +1150,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=None, help="path to config.yaml (default: ./config.yaml)")
     parser.add_argument("--ask", metavar="TEXT", default=None, help="ask one question, print the answer, exit")
     parser.add_argument("--check", action="store_true", help="validate config and environment, then exit")
+    parser.add_argument("--wake", action="store_true",
+                        help="run the startup/wake-up routine once (greeting + briefing), then exit")
+    parser.add_argument("--self-test", action="store_true",
+                        help="run tests/self_test.py and exit")
+    parser.add_argument("--quick", action="store_true",
+                        help="with --self-test: skip the model, microphone, speaker, browser "
+                             "and screen checks (no hardware, no network)")
     parser.add_argument("--today", action="store_true", help="print today's activity report and exit")
     parser.add_argument("--show-prompt", action="store_true", help="print the assembled system prompt and exit")
     parser.add_argument("--model", default=None, help="override brain.model for this run")
@@ -1068,6 +1220,11 @@ def main(argv: list[str] | None = None) -> int:
         print("\nPut a device name or index in config.yaml under voice_in.input_device / voice_out.device.")
         return 0
 
+    if args.self_test:
+        from tests.self_test import run_self_test
+
+        return run_self_test(cfg=cfg, argv=["--quick"] if args.quick else [])
+
     # --check and --today need no LLM, so they work on a bare machine.
     if args.today:
         configure_activity_logger(cfg)
@@ -1128,6 +1285,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.show_prompt:
         print(app.brain.build_system_prompt())
+        return finish(0)
+
+    if args.wake:
+        # Exactly what a normal start says, without starting the loop: the way
+        # to test the greeting/briefing without a model or a microphone.
+        text = app.wake_up(quiet=True)
+        print(f"{app.cfg.assistant_name}: {text}")
+        tts = app.services.get("tts")
+        if tts is not None and getattr(tts, "enabled", False) and not args.no_voice_out:
+            tts.say(text, wait=True)
         return finish(0)
 
     if args.voice_check:

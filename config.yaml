@@ -136,8 +136,11 @@ permissions:
     # anything the allowlist does not already permit. Clicking, typing, pressing
     # keys and closing profiles all need a confirmation.
     - {tier: green,  match: "^(files\\.(read|list|search|stat)|shell\\.(which|info)|browser\\.(read|screenshot|profiles|status|open|goto)|memory\\.read|apps\\.list|clock\\.|activity\\.|assistant\\.(about|list_capabilities|stop))"}
-    - {tier: yellow, match: "^(files\\.(write|mkdir|move|copy)|shell\\.run|apps\\.open|browser\\.(click|type|press|close|continue)|memory\\.(note|set_profile_field)|assistant\\.set_personality)"}
-    - {tier: red,    match: "^(files\\.delete|apps\\.close|shell\\.sudo|browser\\.(login|payment|purchase)|system\\.)"}
+    # Screen: looking is free, watching your screen continuously is a question,
+    # and touching the mouse or keyboard is RED.
+    - {tier: green,  match: "^screen\\.(status|capture|look|guide_stop|guide_last)"}
+    - {tier: yellow, match: "^(files\\.(write|mkdir|move|copy)|shell\\.run|apps\\.open|browser\\.(click|type|press|close|continue)|memory\\.(note|set_profile_field)|assistant\\.set_personality|screen\\.(guide_start|move))"}
+    - {tier: red,    match: "^(files\\.delete|apps\\.close|shell\\.sudo|browser\\.(login|payment|purchase)|screen\\.(click|type|press)|system\\.)"}
   # Extra keywords that force RED even if a rule says otherwise.
   red_keywords: [sudo, admin, rm -rf, del /f, format, mkfs, diskpart, shutdown,
                  regedit, chmod 777, chown, passwd, ssh-key, keychain,
@@ -275,9 +278,13 @@ screen:
   allow_control: false           # must be true (and confirmed) for GARVIS to drive
   speak_directions: true
   max_direction_words: 25        # keep each spoken step short
-  save_frames: false             # true = keep last N frames for debugging
+  save_frames: false             # true = keep the last N guidance frames (debugging)
   keep_frames: 5
   frames_dir: logs/screen_frames
+  shots_dir: logs/screen_shots   # screenshots you ask for are kept here
+  backend: auto                  # auto | mss | pillow | grim | scrot | import | screencapture
+  change_detection: true         # skip the vision call when the screen has not changed
+  allow_cloud_vision: false      # NEVER send a screenshot off this machine unless true
 
 # ---------------------------------------------------------------------------
 # MEMORY (stage 2)

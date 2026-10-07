@@ -48,6 +48,7 @@ def cfg(tmp_path: Path) -> Config:
     config.set("browser.profiles_dir", str(tmp_path / "profiles"))
     config.set("browser.screenshots_dir", str(logs / "browser_shots"))
     config.set("screen.frames_dir", str(logs / "screen_frames"))
+    config.set("screen.shots_dir", str(logs / "screen_shots"))
     config.set("files.follow_symlinks", False)
     return config
 

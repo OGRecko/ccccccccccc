@@ -106,10 +106,11 @@ class Garvis:
 
         # The gate needs the registry, and the notifier lets it speak (stage 5)
         # or print (now) about confirmations and denials.
-        self.services["registry"] = self.registry
+        self.services["registry"] = self.registry  # noqa: SIM118
         self.services["notifier"] = self.notify
         self.setup_voice()
         self.setup_browser()
+        self.setup_screen()
         self.services["notifier"] = self.notify
         self.gate = self._build_gate()
         self.services["gate"] = self.gate
@@ -247,6 +248,42 @@ class Garvis:
             self.log.error("browser manager failed to initialise: %s", exc)
             self.services["browser"] = None
 
+    def setup_screen(self) -> None:
+        """Create the screen service: capture, vision guidance, optional control."""
+        if not self.cfg.get("screen.enabled", True):
+            self.log.info("screen capture disabled in config")
+            return
+        try:
+            from core.screen import ScreenManager
+
+            tts = self.services.get("tts")
+            speaker = tts.say if tts is not None and getattr(tts, "enabled", False) else None
+            def busy() -> bool:
+                """True while the brain is mid-turn or the voice is still talking."""
+                brain = self.services.get("brain")
+                if brain is not None and getattr(brain, "busy", False):
+                    return True
+                current_tts = self.services.get("tts")
+                return bool(current_tts is not None and getattr(current_tts, "is_speaking", lambda: False)())
+
+            manager = ScreenManager(
+                self.cfg,
+                brain_getter=lambda: self.services.get("brain"),
+                activity=self.activity,
+                log=self.log,
+                speaker=speaker,
+                busy_check=busy,
+            )
+            self.services["screen"] = manager
+            detail = manager.describe()
+            if getattr(manager.capturer, "available", False):
+                self.log.info("screen ready: %s", detail)
+            else:
+                self.log.warning("screen capture unavailable: %s", detail)
+        except Exception as exc:
+            self.log.error("screen service failed to initialise: %s", exc)
+            self.services["screen"] = None
+
     def _on_speaking(self, text: str) -> None:
         """Called by TTS when an utterance actually starts."""
         if self.cfg.get("logging.level") == "DEBUG":
@@ -284,6 +321,12 @@ class Garvis:
                         self.log.warning("kill switch halted browser profiles: %s", ", ".join(halted))
                 except Exception:
                     self.log.debug("browser halt failed", exc_info=True)
+            screen = self.services.get("screen")
+            if screen is not None and hasattr(screen, "stop"):
+                try:
+                    screen.stop(f"stop everything: {event.reason}")
+                except Exception:
+                    self.log.debug("screen stop failed", exc_info=True)
             ui = self.services.get("ui")
             if ui is not None and hasattr(ui, "set_status"):
                 try:
@@ -606,7 +649,6 @@ class Garvis:
             max_chars=int(self.cfg.get("voice_out.max_chunk_chars", 220)),
         )
         tts = self.services.get("tts")
-        wake = self.services.get("wake")
         wake_phrases = [str(p) for p in (self.cfg.get("voice_in.wake.phrases", []) or ["garvis"])]
         allow_barge_in = bool(self.cfg.get("safety.barge_in", True)) and bool(
             self.cfg.get("voice_out.allow_barge_in", True)
@@ -759,6 +801,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--devices", action="store_true", help="list audio devices and exit")
     parser.add_argument("--browser-check", action="store_true",
                         help="start the browser, report profiles and rules, then exit")
+    parser.add_argument("--screen-check", action="store_true",
+                        help="report the screen capture/vision setup, then exit")
     parser.add_argument("--log-level", default=None, help="DEBUG|INFO|WARNING|ERROR")
     parser.add_argument("--version", action="version", version=f"GARVIS {VERSION}")
     return parser
@@ -821,6 +865,10 @@ def main(argv: list[str] | None = None) -> int:
         manager = app.services.get("browser")
         if manager is not None:
             print(manager.describe())
+        screen = app.services.get("screen")
+        if screen is not None:
+            print(screen.describe())
+        if manager is not None or screen is not None:
             print()
         print("Tools registered:")
         for category, tools in sorted(app.registry.by_category().items()):
@@ -841,6 +889,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.browser_check:
         return browser_check(app)
+
+    if args.screen_check:
+        return screen_check(app)
 
     if args.say:
         tts = app.services.get("tts")
@@ -878,6 +929,41 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         app.running = False
         app.shutdown()
+
+
+def screen_check(app: "Garvis") -> int:
+    """--screen-check: can GARVIS actually see the screen, and can it speak?"""
+    manager = app.services.get("screen")
+    print(f"{app.cfg.assistant_name} screen check")
+    print("-" * 60)
+    if manager is None:
+        print("screen: disabled in config.yaml (screen.enabled = false)")
+        return 0
+
+    status = manager.status()
+    data = status.data
+    print(f"capture : {data['capture_detail']}")
+    print(f"vision  : {data['vision_model']} - {data['vision_detail']}")
+    print(f"control : {data['controller']}")
+    print(f"guidance: every {data['session']['interval_s']}s, max {data['session']['max_session_s']}s, "
+          f"shots in {manager.shots_dir}")
+    if data.get("cloud_vision_blocked"):
+        print(f"BLOCKED : {data['cloud_vision_blocked']}")
+    if not data["capture_available"]:
+        print("\nInstall a capture backend, then run this again:")
+        print("  pip install mss pillow          # any OS")
+        print("  sudo apt install grim           # Wayland")
+        print("  sudo apt install scrot imagemagick   # X11")
+        return 1
+    # A real capture is the only honest test.
+    sample = manager.capture("check")
+    if sample.ok:
+        print(f"\ntest capture: {sample.message}")
+    if not data["vision_available"]:
+        print("\nRESULT: capture works, vision does not (see above).")
+        return 1
+    print("\nRESULT: screen ready")
+    return 0
 
 
 def browser_check(app: "Garvis") -> int:

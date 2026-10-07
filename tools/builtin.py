@@ -14,7 +14,7 @@ from typing import Any
 
 from core import safety
 
-from .base import GREEN, RED, ToolRegistry, ToolResult, YELLOW
+from .base import GREEN, ToolRegistry, ToolResult, YELLOW
 
 CATEGORY = "assistant"
 
@@ -317,9 +317,20 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
             f"allowed read folders: {', '.join(str(p) for p in cfg.allowed_folders('read')) or 'none'}",
             f"allowed write folders: {', '.join(str(p) for p in cfg.allowed_folders('write')) or 'none'}",
             f"allowed sites: {', '.join(cfg.allowed_sites()) or 'none'}",
+            f"screen: {_screen_line(svc('screen'))}",
             f"red-keyword gate: {len(cfg.get('permissions.red_keywords', []) or [])} keywords active",
         ]
         return ToolResult.success("\n".join(lines), display="runtime summary")
 
     if log:
         log.info("registered %d builtin tools", len(registry))
+
+
+def _screen_line(screen: object) -> str:
+    """One line about the screen service for assistant.about (stage 7)."""
+    if screen is None:
+        return "not available"
+    try:
+        return screen.describe()
+    except Exception:
+        return "available"

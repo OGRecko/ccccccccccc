@@ -546,6 +546,7 @@ class Brain:
         self.history: list[dict[str, Any]] = []
         self._cancel = threading.Event()
         self._lock = threading.RLock()
+        self._busy = threading.Event()
 
     # -- prompt ------------------------------------------------------------
     def _load_prompt(self) -> str:
@@ -715,6 +716,11 @@ class Brain:
         self.history = trimmed
 
     # -- main entry point --------------------------------------------------
+    @property
+    def busy(self) -> bool:
+        """True while a turn is being generated (screen guidance waits for this)."""
+        return self._busy.is_set()
+
     def respond(
         self,
         user_text: str,
@@ -727,6 +733,21 @@ class Brain:
         ``on_event`` receives deltas as they arrive, so the caller can stream to
         TTS. This method blocks until the turn is complete or interrupted.
         """
+        with self._lock:
+            self._busy.set()
+            try:
+                return self._respond_locked(user_text, on_event, personality, image_b64)
+            finally:
+                self._busy.clear()
+
+    def _respond_locked(
+        self,
+        user_text: str,
+        on_event: Callable[[BrainEvent], None] | None = None,
+        personality: str | None = None,
+        image_b64: str | None = None,
+    ) -> TurnResult:
+        """The body of :meth:`respond`; the caller already holds the lock."""
         with self._lock:
             self.clear_interrupt()
             started = time.perf_counter()

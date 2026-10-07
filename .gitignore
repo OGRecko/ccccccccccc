@@ -1,0 +1,26 @@
+# ---- GARVIS local runtime artifacts (never commit these) ----
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Runtime data
+logs/
+sandbox/
+state/
+profiles/*
+!profiles/README.md
+!profiles/.gitkeep
+
+# Local overrides (keep your real config out of git)
+config.local.yaml
+.env
+
+# Secrets / creds must never be committed
+*.key
+*.pem
+
+# OS noise
+.DS_Store
+Thumbs.db

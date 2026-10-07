@@ -1,0 +1,54 @@
+# ============================================================================
+# GARVIS requirements
+# ----------------------------------------------------------------------------
+# Install in stages (see README) or all at once:
+#     python -m venv .venv && . .venv/bin/activate   (Windows: .venv\Scripts\activate)
+#     pip install -r requirements.txt
+#     playwright install chromium                      # stage 6
+#
+# NOTE: stage 1 only needs the "CORE (stage 1)" block below.
+# Heavy blocks (voice, vision, browser) are commented with the stage that needs
+# them so you can get the text brain running first, then add capabilities.
+# ============================================================================
+
+# ---- CORE (stage 1) : text chat loop with Ollama ----
+PyYAML>=6.0
+requests>=2.31
+
+# ---- MEMORY / LOGGING (stage 2) : stdlib only, nothing extra needed ----
+
+# ---- PC TOOLS (stage 4) : screenshot + optional mouse/keyboard ----
+mss>=9.0.1                 # fast cross-platform screenshots
+Pillow>=10.0.0             # image encode/annotate for the vision model
+psutil>=5.9                # process list / app close
+pyautogui>=0.9.54          # OPTIONAL: mouse+keyboard control (RED-tier, off by default)
+
+# ---- VOICE IN (stage 5) ----
+faster-whisper>=1.0.3      # local STT (pulls ctranslate2; first run downloads the model)
+sounddevice>=0.4.6         # mic capture
+soundfile>=0.12.1          # wav read/write
+numpy>=1.24                # audio buffers
+webrtcvad>=2.0.10          # OPTIONAL: voice-activity detection for tight end-of-speech
+openwakeword>=0.6.0        # OPTIONAL: "Garvis" wake word (see README for custom model)
+keyboard>=0.13.5           # global hotkeys (kill switch, push-to-talk) - Windows/Linux+X11
+                           # macOS: use 'pynput' instead; config.hotkeys.backend handles it
+pynput>=1.7.6              # cross-platform hotkey fallback (esp. macOS)
+
+# ---- VOICE OUT (stage 5) ----
+kokoro>=0.9.2              # OPTIONAL high-quality TTS; needs torch
+piper-tts>=1.2.0           # OPTIONAL fallback TTS, tiny + fast; needs a .onnx voice
+sounddevice>=0.4.6         # playback
+# Windows-only alternative for Kokoro/Piper audio output:
+# simpleaudio>=1.0.4
+
+# ---- BROWSER (stage 6) ----
+playwright>=1.44.0         # then run: playwright install chromium
+
+# ---- UI (stage 8) ----
+pystray>=0.19.5            # system tray
+Pillow>=10.0.0             # tray icon rendering
+pillow>=10.0.0
+# tkinter ships with CPython; on Debian/Ubuntu: sudo apt install python3-tk
+
+# ---- DEV / TESTS ----
+pytest>=8.0

@@ -1,0 +1,325 @@
+# ============================================================================
+#  GARVIS - config.yaml
+#  Everything tunable lives here. Restart GARVIS after editing (or say
+#  "Garvis, reload config" once the tool exists).
+#
+#  Paths may use ~ , relative paths (resolved against the project root), and
+#  ${ENV_VAR} expansion. Never put secrets in this file - use env vars.
+#
+#  STAGE STATUS: sections are labelled with the build stage that reads them.
+#  Sections for later stages are pre-filled with safe defaults and are simply
+#  ignored by earlier stages.
+# ============================================================================
+
+app:
+  name: GARVIS                 # spoken/written name
+  wake_name: Garvis            # what you say to wake it
+  user_name: Boss              # how GARVIS addresses you ("Boss", "Sir", your name)
+  timezone: local              # "local" or e.g. "Europe/Berlin"
+  data_dir: .                  # root for runtime data (logs/, state/, memory/ ...)
+
+# ---------------------------------------------------------------------------
+# BRAIN - the LLM (stage 1)
+# ---------------------------------------------------------------------------
+brain:
+  provider: ollama             # ollama | openai_compatible (cloud fallback, see below)
+  host: http://127.0.0.1:11434
+  model: llama3.1:8b           # MUST be tool-calling capable.
+                               #   good tools+CPU/GPU: llama3.1:8b, qwen2.5:7b,
+                               #   qwen2.5:14b (better), mistral-nemo:12b, qwen3:8b
+  vision_model: llava:7b       # screen reading (stage 7).
+                               #   better on screen text: qwen2.5vl:7b, minicpm-v,
+                               #   llama3.2-vision:11b
+  temperature: 0.6
+  num_ctx: 8192                # context window; raise for long browser reads
+  num_predict: 512             # max tokens per reply (keeps voice replies snappy)
+  keep_alive: 30m              # keep the model resident in VRAM between turns
+  connect_timeout_s: 5         # TCP connect timeout to Ollama
+  request_timeout_s: 180       # first-token/total read timeout for /api/chat
+  max_tool_iterations: 8       # hard cap on tool-call round-trips per user turn
+  history_turns: 12            # how many past messages to keep in context
+  personality: standard        # standard | sassy | formal | hyped | focus | chill
+  system_prompt: prompts/system_prompt.md
+  # Optional cloud fallback. OFF BY DEFAULT - nothing leaves this machine
+  # unless you flip `enabled` to true AND set the API key env var.
+  cloud_fallback:
+    enabled: false
+    provider: openai_compatible   # openai_compatible | anthropic
+    base_url: https://api.openai.com/v1
+    model: gpt-4o-mini
+    api_key_env: GARVIS_CLOUD_API_KEY   # value is read from env, never logged
+    use_only_if_local_down: true        # true = fallback only when Ollama fails
+    allow_tools: false                  # false = fallback can talk, cannot act
+
+# ---------------------------------------------------------------------------
+# VOICE OUT - text to speech (stage 5). Interruptible by design.
+# ---------------------------------------------------------------------------
+voice_out:
+  enabled: true
+  engine: piper                # piper | kokoro | pyttsx3
+  voice: en_US-ryan-high       # deep male voice.
+                               #   piper voices:  en_US-ryan-high, en_GB-alan-medium
+                               #   kokoro voices: am_michael, am_onyx, bm_george
+  speed: 1.0                   # 0.8 slower ... 1.2 faster
+  volume: 0.9                  # 0.0 - 1.0
+  device: default              # output device name/index, "default" = system default
+  piper_exe: piper             # path to the piper binary if not on PATH
+  voices_dir: models/voices    # where .onnx voice files live
+  kokoro_model: models/kokoro/kokoro-v1.0.onnx   # stage-5 optional paths
+  kokoro_voices: models/kokoro/voices-v1.0.bin
+  sentence_chunking: true      # stream LLM output -> speak sentence by sentence
+  min_chunk_chars: 12          # do not speak fragments shorter than this
+  max_chunk_chars: 220         # force-flush long sentences at punctuation
+  allow_barge_in: true         # interrupt GARVIS by speaking over it (stage 12)
+
+# ---------------------------------------------------------------------------
+# VOICE IN - speech to text + wake word (stage 5)
+# ---------------------------------------------------------------------------
+voice_in:
+  enabled: true
+  sample_rate: 16000
+  input_device: default        # mic name/index, "default" = system default
+  stt:
+    engine: faster_whisper
+    model: distil-large-v3     # base.en / small.en / medium.en / large-v3 / distil-large-v3
+    device: auto               # auto | cpu | cuda
+    compute_type: auto         # auto | int8 | float16  (int8 = best on CPU)
+    language: en
+    beam_size: 1               # 1 = fastest, 5 = most accurate
+    vad_filter: true           # drop silence, big speed win
+  listen:
+    silence_end_s: 0.9         # stop recording after this much silence
+    max_utterance_s: 20
+    min_utterance_s: 0.35
+    start_timeout_s: 8         # give up if no speech starts (avoids stuck mic)
+  wake:
+    enabled: true
+    engine: openwakeword       # openwakeword | porcupine | none (push-to-talk only)
+    model: garvis              # built-in name or a path to your custom .tflite/.onnx
+    builtin_fallback: hey_jarvis   # used if the custom "garvis" model is absent
+    threshold: 0.5
+    # Wake phrases that are also accepted as plain text at the start of a command
+    phrases: ["garvis", "hey garvis", "okay garvis"]
+
+# ---------------------------------------------------------------------------
+# HOTKEYS (stage 8). Backend: keyboard lib (Win/Linux) or pynput (macOS).
+# ---------------------------------------------------------------------------
+hotkeys:
+  backend: auto                # auto | keyboard | pynput | none
+  killswitch: ctrl+alt+esc     # HARD STOP: halts tools, TTS, everything
+  push_to_talk: ctrl+alt+space # hold to talk without the wake word
+  cycle_personality: ctrl+alt+p
+  screenshot_ask: ctrl+alt+s   # "look at my screen" without speaking
+
+# ---------------------------------------------------------------------------
+# PERMISSIONS - the GREEN / YELLOW / RED gate (stage 3)
+# The LLM cannot change these at runtime; only you can, by editing this file.
+# ---------------------------------------------------------------------------
+permissions:
+  # Fail closed: any tool with no declared tier is treated as RED.
+  default_tier: red
+  # Actions whose tier is decided by name pattern rather than the tool's
+  # declared default (checked in order, first match wins).
+  rules:
+    - {tier: green,  match: "^(files\\.(read|list|stat)|shell\\.(which)|browser\\.(read|screenshot)|screen\\.|memory\\.read|apps\\.list|time\\.)"}
+    - {tier: yellow, match: "^(files\\.(write|move|copy)|shell\\.run|apps\\.(open|close)|browser\\.(click|type|goto|open|submit))"}
+    - {tier: red,    match: "^(files\\.delete|shell\\.sudo|browser\\.(login|payment|purchase)|system\\.)"}
+  # Extra keywords that force RED even if a rule says otherwise.
+  red_keywords: [sudo, admin, rm -rf, del /f, format, mkfs, diskpart, shutdown,
+                 regedit, chmod 777, chown, passwd, ssh-key, keychain,
+                 delete, uninstall, drop table, transfer, withdraw, payment, bank,
+                 wire, crypto, seed phrase, private key, firewall, defender,
+                 antivirus, bitlocker, password, 2fa, recovery]
+  yellow_confirm:
+    mode: spoken               # spoken | click | either
+    timeout_s: 20              # no answer in time = denied
+    phrase: yes                # any of these words count as approval
+    also_accept: [yeah, yep, ok, okay, go ahead, do it, confirm]
+  red_confirm:
+    mode: both                 # spoken AND clicked
+    timeout_s: 45
+    require_repeat: true       # you must repeat the exact action first
+    require_phrase: confirm    # ...then say the word "confirm"
+    always_show_exact_args: true   # show the full command/path/URL being confirmed
+  spoken_denials: true         # GARVIS says "denied" out loud
+  log_every_decision: true
+
+# ---------------------------------------------------------------------------
+# ALLOWLISTS - tools may only touch what is listed here (stage 3/4/6)
+# Everything else is blocked (reads) or RED (writes).
+# ---------------------------------------------------------------------------
+files:
+  sandbox_dir: sandbox          # default scratch folder for GARVIS
+  allowed_read:                 # folders GARVIS may read
+    - sandbox
+    - memory
+    - ~/Documents               # examples - delete what you do not want read
+  allowed_write:                # folders GARVIS may create/modify
+    - sandbox
+    - memory
+  # Sub-paths that stay off-limits even inside the folders above.
+  denied_globs: ["**/.ssh/**", "**/.aws/**", "**/*.key", "**/*.pem",
+                 "**/.env", "**/id_rsa*", "**/Login Data", "**/Cookies",
+                 "**/credentials.json", "**/*password*", "**/*secret*"]
+  max_read_bytes: 2000000       # refuse to slurp huge files into context
+  follow_symlinks: false        # symlink escape protection
+
+shell:
+  enabled: true                 # stage 4
+  default_cwd: sandbox
+  timeout_s: 30                 # every command is killed at this point
+  max_output_chars: 20000       # truncate before it hits the LLM context
+  require_allowlist: true       # true = only executables listed below may run
+  allowlist:                    # first token of the command must match one of these
+    - echo, ls, dir, pwd, cat, type, head, tail, wc, grep, find, where, which,
+      python, python3, pip, git, node, npm, code, notepad, calc, explorer,
+      mkdir, copy, cp, move, mv, curl, wget, tasklist, ps, ipconfig, ifconfig,
+      systeminfo, date, time, whoami, hostname, df, free, ver
+  blocked_patterns:             # never runs, even if YELLOW-confirmed by mistake
+    - "rm\\s+-rf\\s+/"
+    - "format\\s+[a-z]:"
+    - "del\\s+/[fsq]"
+    - "shutdown|reboot|mkfs|diskpart|reg\\s+delete|net\\s+user|takeown|icacls"
+    - "curl.*\\|.*(sh|bash|powershell)"
+    - "invoke-expression|iex\\("
+    - ">:.*\\\\.(ssh|aws)"
+    - "chmod\\s+777\\s+/"
+  env_allow: [PATH, HOME, USERPROFILE, TEMP, TMP, LANG, SYSTEMROOT, USERNAME]
+
+# ---------------------------------------------------------------------------
+# BROWSER - Playwright, one persistent profile per account (stage 6)
+# ---------------------------------------------------------------------------
+browser:
+  enabled: true
+  engine: playwright
+  headless: false                # keep visible: you can take over any time
+  profiles_dir: profiles
+  default_profile: default       # -> profiles/default  (its own cookies/login)
+  allowed_sites:                 # GARVIS may only navigate to these domains
+    - google.com
+    - duckduckgo.com
+    - wikipedia.org
+    - github.com
+    - news.ycombinator.com
+    - youtube.com
+    - localhost
+  # Sites that are ALWAYS RED (never automated, no exceptions):
+  bank_sites: [chase.com, bankofamerica.com, paypal.com, coinbase.com,
+               binance.com, wise.com, revolut.com, stripe.com]
+  action_timeout_s: 15
+  navigation_timeout_s: 30
+  slow_mo_ms: 0
+  human_takeover:
+    detect_captcha: true         # stop and hand back control on CAPTCHA
+    detect_2fa: true             # stop on OTP/2FA prompts
+    detect_botblock: true        # "unusual traffic", "verify you are human", 429/403 walls
+    wait_for_human_s: 300        # how long GARVIS waits while you take over
+  never_auto_submit: true        # typing is allowed, hitting Send/Pay is not (RED)
+  screenshots_dir: logs/browser_shots
+
+# ---------------------------------------------------------------------------
+# SCREEN - capture + vision guidance (stage 7)
+# ---------------------------------------------------------------------------
+screen:
+  enabled: true
+  monitor: 1                     # 0 = all monitors combined, 1 = primary
+  capture_interval_s: 2.5        # guidance mode cadence (2-3s per spec)
+  max_session_s: 600             # auto-stop a guidance session after this long
+  downscale_to_width: 1280       # smaller = faster vision pass
+  jpeg_quality: 70
+  vision_timeout_s: 60
+  guidance_only: true            # true = speak directions, never click
+  allow_control: false           # must be true (and confirmed) for GARVIS to drive
+  speak_directions: true
+  max_direction_words: 25        # keep each spoken step short
+  save_frames: false             # true = keep last N frames for debugging
+  keep_frames: 5
+  frames_dir: logs/screen_frames
+
+# ---------------------------------------------------------------------------
+# MEMORY (stage 2)
+# ---------------------------------------------------------------------------
+memory:
+  dir: memory
+  profile_file: memory/profile.md
+  project_log_file: memory/project_log.md
+  load_profile: true
+  load_project_log: true
+  project_log_tail_lines: 80     # only the recent log goes into context
+  max_chars_loaded: 8000         # hard cap on memory injected into the prompt
+  autosave: true
+  auto_log_commands: true        # append notable actions to project_log.md
+
+# ---------------------------------------------------------------------------
+# STATE / CRASH RESUME (stage 8)
+# ---------------------------------------------------------------------------
+state:
+  dir: state
+  resume_on_start: true
+  autosave_interval_s: 5
+  keep_history: 20               # how many finished tasks to keep
+
+# ---------------------------------------------------------------------------
+# LOGGING (stage 2, required by stage 1 loop)
+# ---------------------------------------------------------------------------
+logging:
+  level: INFO                    # DEBUG | INFO | WARNING | ERROR
+  file: logs/garvis.log
+  console: true
+  activity_log: logs/activity_log.txt   # required human-readable audit trail
+  activity_jsonl: logs/activity_log.jsonl  # machine-readable twin ("what did you do today")
+  redact_patterns:               # never written to any log file
+    - "(?i)(password|passwd|pwd|secret|token|api[_-]?key|bearer)\\s*[:=]\\s*\\S+"
+    - "(?i)card\\s*(number|no\\.?)\\s*[:=]?\\s*[0-9][0-9 \\-]{10,}"
+    - "\\b(?:[0-9]{1,3}\\.){3}[0-9]{1,3}\\b"   # internal IPs are boring but cheap to hide
+  redaction_replacement: "[REDACTED]"
+  console_style: compact
+
+# ---------------------------------------------------------------------------
+# UI (stage 8): tray + overlay with status, current task, big STOP button
+# ---------------------------------------------------------------------------
+ui:
+  enabled: true
+  tray: true                     # system tray icon + menu
+  overlay: true                  # small always-on-top status window
+  overlay_position: bottom-right # top-left | top-right | bottom-left | bottom-right
+  overlay_always_on_top: true
+  overlay_opacity: 0.92
+  show_transcript: true          # show what was heard
+  stop_button_confirm: false     # false = the STOP button stops instantly
+  theme: dark
+
+# ---------------------------------------------------------------------------
+# SAFETY / RELIABILITY (stages 3, 5, 8)
+# ---------------------------------------------------------------------------
+safety:
+  kill_phrases:                  # spoken hard-stop (also Ctrl+Alt+Esc)
+    - "garvis, stop everything"
+    - "garvis stop everything"
+    - "garvis, stop"
+    - "stop everything"
+    - "abort"
+  tool_timeout_s: 60             # default timeout for any tool without its own
+  tool_retries: 1                # one retry, then report the failure honestly
+  confirm_timeout_s: 30
+  max_consecutive_errors: 3      # after this many, GARVIS stops and asks
+  wake_word_required: false      # true = ignore speech unless woken this turn
+  allow_cloud_when_offline: false
+  screenshot_after_action: true  # verify state-changing actions (requirement 6)
+  barge_in: true                 # speaking interrupts GARVIS mid-sentence
+  startup_greeting: "Systems online. What are we doing?"
+  daily_briefing: true           # on startup: today's log + pending state
+
+# ---------------------------------------------------------------------------
+# SELF TEST (stage 9)
+# ---------------------------------------------------------------------------
+self_test:
+  check_ollama: true
+  check_models: true             # warns (does not fail) if a model is not pulled
+  check_mic: true
+  check_speaker: true
+  check_tts_voice: true
+  check_playwright: true
+  check_tray: true
+  check_folders: true
+  timeout_s: 90

@@ -68,6 +68,7 @@ class Garvis:
         self.log = get_logger("main")
         self.running = False
         self.started_at = time.time()
+        self.pending_resume: Any = None     # an unfinished task from the last run
 
         self.activity = self._setup_logging()
         self.memory = Memory.from_config(cfg)
@@ -82,8 +83,8 @@ class Garvis:
             "activity": self.activity,
             "memory": self.memory,
             "brain": None,        # filled below
-            "state": None,        # stage 8
-            "ui": None,           # stage 8
+            "state": None,        # built in setup_state()
+            "ui": None,           # built in setup_ui()
             "browser": None,      # stage 6
             "tts": None,          # built in setup_voice()
             "voice_in": None,
@@ -108,12 +109,14 @@ class Garvis:
         # or print (now) about confirmations and denials.
         self.services["registry"] = self.registry  # noqa: SIM118
         self.services["notifier"] = self.notify
+        self.setup_state()
         self.setup_voice()
         self.setup_browser()
         self.setup_screen()
         self.services["notifier"] = self.notify
         self.gate = self._build_gate()
         self.services["gate"] = self.gate
+        self.setup_ui()
 
         self.brain = Brain(
             cfg=cfg,
@@ -284,10 +287,105 @@ class Garvis:
             self.log.error("screen service failed to initialise: %s", exc)
             self.services["screen"] = None
 
+    def setup_state(self) -> None:
+        """Task state first: it is what makes a crash recoverable."""
+        if not self.cfg.get("state.enabled", True):
+            self.log.info("task state disabled in config")
+            return
+        try:
+            from core.state import StateStore
+
+            store = StateStore(self.cfg, activity=self.activity, log=self.log)
+            store.load()
+            interrupted = store.begin_session()
+            self.services["state"] = store
+            self.log.info("task state ready (%s)", store.path)
+            if interrupted is not None:
+                # Say it out loud: the user should hear about unfinished work.
+                self.attach_interruption(interrupted)
+        except Exception as exc:
+            self.log.error("task state failed to initialise: %s", exc)
+            self.services["state"] = None
+
+    def attach_interruption(self, task: Any) -> None:
+        """Keep the interrupted task around so preflight can offer a resume."""
+        self.pending_resume = task
+        self.log.warning(
+            "last run did not exit cleanly; unfinished task: %s (%d step(s) recorded)",
+            task.description, len(task.steps),
+        )
+
+    def setup_ui(self) -> None:
+        """Tray icon and overlay, if this machine can show them."""
+        if self.args.no_ui:
+            self.log.info("ui disabled by --no-ui; status goes to the terminal")
+        try:
+            from core.ui import build_ui
+
+            def pause_listening() -> bool:
+                """Tray/overlay 'pause listening': stops the microphone, nothing else."""
+                listener = self.services.get("voice_in")
+                if listener is None or not hasattr(listener, "pause"):
+                    return False
+                if getattr(listener, "paused", False):
+                    listener.resume()
+                    return True
+                listener.pause()
+                return False
+
+            tts = self.services.get("tts")
+            ui = build_ui(
+                self.cfg,
+                log=self.log,
+                activity=self.activity,
+                on_stop=self._ui_stop,
+                on_resume=self._ui_resume,
+                on_toggle_listen=pause_listening,
+                on_personality=self._ui_set_personality,
+                on_today=lambda: self.activity.today_report(limit=20),
+                on_quit=self._ui_quit,
+            )
+            if self.args.no_ui:
+                ui.enabled = False
+            self.services["ui"] = ui
+            ui.start()
+            if ui.available:
+                self.log.info("ui ready: %s", ui.describe())
+            else:
+                self.log.info("ui: %s", ui.reason)
+            del tts
+        except Exception as exc:
+            self.log.error("ui failed to initialise: %s", exc)
+            self.services["ui"] = None
+
+    # -- what the UI buttons do -------------------------------------------
+    def _ui_stop(self, reason: str = "ui STOP button") -> None:
+        """The STOP button is the kill switch, not a chat message."""
+        self.killswitch.trigger(f"ui: {reason}", source="ui")
+
+    def _ui_resume(self) -> None:
+        if self.killswitch.frozen:
+            self.killswitch.resume("resumed from the ui")
+        tts = self.services.get("tts")
+        if tts is not None:
+            tts.resume()
+        self._set_ui_status("idle", "back on")
+        self.notify("Back on.")
+
+    def _ui_set_personality(self, name: str) -> bool:
+        return bool(self.brain is not None and self.brain.set_personality(name))
+
+    def _ui_quit(self) -> None:
+        self.log.info("quit requested from the ui")
+        self.running = False
+
     def _on_speaking(self, text: str) -> None:
         """Called by TTS when an utterance actually starts."""
         if self.cfg.get("logging.level") == "DEBUG":
             self.log.debug("speaking: %s", text[:80])
+        # The tray/overlay shows what GARVIS is doing. Never overwrite a stop:
+        # the kill switch must stay visible until the user resumes.
+        self._set_ui_status("speaking", text.strip().splitlines()[0][:80] if text.strip() else "")
 
     def _subscribe_killswitch(self) -> None:
         """Wire the emergency stop to everything it must halt.
@@ -330,7 +428,7 @@ class Garvis:
             ui = self.services.get("ui")
             if ui is not None and hasattr(ui, "set_status"):
                 try:
-                    ui.set_status("STOPPED", event.reason)
+                    ui.set_status("stopped", event.reason)
                 except Exception:
                     self.log.debug("ui status failed", exc_info=True)
 
@@ -349,6 +447,9 @@ class Garvis:
 
         if self.cfg.cloud_fallback_enabled:
             print("  !! Cloud fallback is ENABLED in config.yaml: prompts may leave this machine.\n")
+
+        if self.pending_resume is not None:
+            self.report_interruption(quiet=quiet)
 
         if not self.brain.client.is_up():
             problems.append(
@@ -385,6 +486,78 @@ class Garvis:
             self.log.info("permission gate: %s", "active" if self.gate else "DISABLED (fail-closed)")
         return True
 
+    def report_interruption(self, quiet: bool = False) -> None:
+        """Tell the user about an unfinished task, and resume it if they asked."""
+        state = self.services.get("state")
+        if state is None or self.pending_resume is None:
+            return
+        report = state.crash_report()
+        if not report:
+            return
+        # A crash report is important enough to print even in --check mode:
+        # the user should never have to guess whether last time ended badly.
+        print(f"  -- unfinished business --\n  {report.replace(chr(10), chr(10) + '  ')}\n")
+        self.activity.event("system", "recovered after an unclean exit", extra={"report": report})
+        if not self.args.resume:
+            return
+        task = state.resume_task("resumed automatically at startup (--resume)")
+        if task is None:
+            return
+        self.pending_resume = None
+        summary = task.summarize()
+        self.log.info("resuming task: %s", task.description)
+        # Always show what is being resumed: that is the whole point of --resume.
+        print(f"  -- resuming --\n  {summary.replace(chr(10), chr(10) + '  ')}\n")
+        self._set_ui_status("idle", f"resumed: {task.description}")
+
+    def _handle_task_phrases(self, text: str) -> bool:
+        """Answer "resume" / "rollback plan" locally when a task is unfinished.
+
+        The offer made after a crash must be answerable even if the model is the
+        thing that is down. These phrases are only intercepted when a task is
+        actually running or waiting, and only on an exact match, so "resume the
+        music" still goes to the model like any other sentence.
+        """
+        from core.killswitch import KillSwitch
+
+        state = self.services.get("state")
+        if state is None:
+            return False
+        task = getattr(state, "current", None) or getattr(state, "interrupted", None)
+        if task is None:
+            return False
+        normalized = KillSwitch._normalize(text)
+
+        def configured(key: str, fallback: tuple[str, ...]) -> set[str]:
+            values = self.cfg.get(f"state.{key}", None)
+            if not values:
+                values = fallback
+            return {KillSwitch._normalize(str(item)) for item in values}
+
+        if normalized in configured("resume_phrases", (
+            "resume", "resume the task", "carry on", "continue where you left off",
+            "pick up where you left off", "where were we", "what were you doing",
+        )):
+            resumed = state.resume_task("resumed when the user said so")
+            if resumed is None:
+                return False
+            self.activity.event("state", f"task resumed by voice: {resumed.description}")
+            self._set_ui_status("listening", f"resumed: {resumed.description}")
+            self.say(
+                f"Picking up where we left off: {resumed.description}. "
+                f"{resumed.summarize()}"
+            )
+            return True
+
+        if normalized in configured("rollback_phrases", (
+            "rollback plan", "roll back plan", "undo plan", "how do i undo that",
+            "how do i undo it", "what did you change",
+        )):
+            plan = state.rollback_plan(task)
+            self.say("This is how you undo it - I will not do it on my own: " + " ".join(plan))
+            return True
+        return False
+
     def say(self, text: str, wait: bool = True) -> None:
         """Print and, from stage 5, also speak."""
         print(f"\n{self.cfg.assistant_name}: {text}\n")
@@ -401,6 +574,12 @@ class Garvis:
         Wired into the permission gate as ``services['notifier']`` so the gate can
         tell the user what it is waiting for without going through the model.
         """
+        ui = self.services.get("ui")
+        if ui is not None:
+            try:
+                ui.notify(text)
+            except Exception:
+                self.log.debug("ui notify failed", exc_info=True)
         tts = self.services.get("tts")
         if tts is not None and getattr(tts, "enabled", False):
             print(f"  [{self.cfg.assistant_name.lower()} speaks] {text}")
@@ -436,6 +615,10 @@ class Garvis:
             return False
 
         self.activity.event("user", text)
+        state = self.services.get("state")
+        if state is not None:
+            state.note_user_request(text)
+        self._set_ui_status("thinking", "working on it")
 
         tts = self.services.get("tts")
         speaking = tts is not None and getattr(tts, "enabled", False)
@@ -464,6 +647,8 @@ class Garvis:
                 print(f"\n  [error] {event.text}", flush=True)
 
         if self._handle_stop_phrases(text):
+            return True
+        if self._handle_task_phrases(text):
             return True
 
         started = time.perf_counter()
@@ -505,9 +690,29 @@ class Garvis:
                 "model": result.model,
             },
         )
+        if state is not None:
+            # A task GARVIS started by itself is closed here if the turn went
+            # cleanly; one that failed is left open so it can be resumed.
+            try:
+                state.end_turn(ok=not (result.error or result.interrupted))
+            except Exception:
+                self.log.debug("end_turn failed", exc_info=True)
+        self._set_ui_status("idle" if not result.interrupted else "idle", "")
         if self.cfg.get("logging.level") == "DEBUG":
             self.log.debug("turn took %.0f ms", (time.perf_counter() - started) * 1000)
         return True
+
+    def _set_ui_status(self, status: str, detail: str = "") -> None:
+        """Update the tray/overlay. A stopped assistant stays stopped."""
+        ui = self.services.get("ui")
+        if ui is None:
+            return
+        if status != "stopped" and self.killswitch is not None and self.killswitch.frozen:
+            return          # the user stopped everything; that is the status that matters
+        try:
+            ui.set_status(status, detail)
+        except Exception:
+            self.log.debug("ui set_status failed", exc_info=True)
 
     @staticmethod
     def _is_quit_phrase(text: str) -> bool:
@@ -599,13 +804,14 @@ class Garvis:
 
     # -- loops -------------------------------------------------------------
     def run_text_loop(self) -> int:
-        """Stage 1 loop: typed input, streamed replies. Voice replaces this later."""
+        """Typed input, streamed replies. Voice is run_voice_loop()."""
         chunker = SentenceChunker(
             min_chars=int(self.cfg.get("voice_out.min_chunk_chars", 12)),
             max_chars=int(self.cfg.get("voice_out.max_chunk_chars", 220)),
         )
         print("Type a message. /help lists local commands.\n")
         while self.running:
+            self._set_ui_status("listening", "waiting for you")
             try:
                 line = input(f"{self.cfg.user_name.lower()}> ")
             except (EOFError, KeyboardInterrupt):
@@ -752,7 +958,20 @@ class Garvis:
             extra={"uptime_s": round(up, 1)},
         )
         self.log.info("shutdown after %.1f s", up)
-        for service_name in ("browser", "tts", "state", "ui", "killswitch"):
+        state = self.services.get("state")
+        if state is not None:
+            # Mark the state file clean *before* the UI goes: an unfinished task
+            # stays unanswered for the next run, which is the point.
+            try:
+                data = state.status()
+                if data.get("task"):
+                    self.log.warning(
+                        "shutting down with an unfinished task: %s",
+                        (data.get("task") or {}).get("description"),
+                    )
+            except Exception:
+                pass
+        for service_name in ("ui", "browser", "tts", "state", "killswitch"):
             service = self.services.get(service_name)
             closer = getattr(service, "close", None) or getattr(service, "shutdown", None)
             if callable(closer):
@@ -792,6 +1011,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ollama", default=None, help="override brain.host, e.g. http://127.0.0.1:11999")
     parser.add_argument("--personality", default=None, help="start in this tone mode")
     parser.add_argument("--no-tools", action="store_true", help="chat only; the model cannot act")
+    parser.add_argument("--no-ui", action="store_true",
+                        help="no tray and no overlay; status goes to the terminal")
+    parser.add_argument("--resume", action="store_true",
+                        help="pick up the unfinished task from the last run, if there is one")
     parser.add_argument("--voice", action="store_true", help="start in voice mode (wake word + speech)")
     parser.add_argument("--text", action="store_true", help="force the text prompt (default)")
     parser.add_argument("--no-voice-out", action="store_true", help="print replies, do not speak them")
@@ -859,6 +1082,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Startup failed: {exc}", file=sys.stderr)
         return 2
 
+    def finish(code: int) -> int:
+        """Exit a one-shot run cleanly, so the state file is not left dirty.
+
+        Every diagnostic path goes through here: otherwise `python main.py --check`
+        would look like a crash to the next run, and GARVIS would greet the user
+        with a resume offer for work that never existed.
+        """
+        try:
+            app.shutdown()
+        except Exception:
+            pass
+        return code
+
     if args.check:
         print(describe(cfg))
         print()
@@ -868,6 +1104,16 @@ def main(argv: list[str] | None = None) -> int:
         screen = app.services.get("screen")
         if screen is not None:
             print(screen.describe())
+        state = app.services.get("state")
+        if state is not None:
+            data = state.status()
+            task = (data.get("task") or {}).get("description")
+            print(f"task state: {data['state_file']} "
+                  f"(recording={'on' if data['recording'] else 'off'}, "
+                  f"current task={task or 'none'})")
+        ui = app.services.get("ui")
+        if ui is not None:
+            print(ui.describe())
         if manager is not None or screen is not None:
             print()
         print("Tools registered:")
@@ -878,20 +1124,20 @@ def main(argv: list[str] | None = None) -> int:
         ok = app.preflight(quiet=True)
         print()
         print("RESULT:", "ready" if ok else "not ready (see above)")
-        return 0 if ok else 1
+        return finish(0 if ok else 1)
 
     if args.show_prompt:
         print(app.brain.build_system_prompt())
-        return 0
+        return finish(0)
 
     if args.voice_check:
-        return voice_check(app)
+        return finish(voice_check(app))
 
     if args.browser_check:
-        return browser_check(app)
+        return finish(browser_check(app))
 
     if args.screen_check:
-        return screen_check(app)
+        return finish(screen_check(app))
 
     if args.say:
         tts = app.services.get("tts")
@@ -904,17 +1150,16 @@ def main(argv: list[str] | None = None) -> int:
         tts.say(args.say, wait=True)
         if tts.last_error:
             print(f"last error: {tts.last_error}")
-            return 1
+            return finish(1)
         print("done")
-        return 0
+        return finish(0)
 
     if not app.preflight():
         return 1
 
     if args.ask:
         app.handle_line(args.ask)
-        app.shutdown()
-        return 0
+        return finish(0)
 
     app.running = True
     app.activity.event(
@@ -925,10 +1170,9 @@ def main(argv: list[str] | None = None) -> int:
         extra={"version": VERSION, "python": sys.version.split()[0], "pid": os.getpid()},
     )
     try:
-        return app.run_voice_loop() if args.voice else app.run_text_loop()
+        return finish(app.run_voice_loop() if args.voice else app.run_text_loop())
     finally:
         app.running = False
-        app.shutdown()
 
 
 def screen_check(app: "Garvis") -> int:

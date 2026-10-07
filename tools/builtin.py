@@ -318,6 +318,8 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
             f"allowed write folders: {', '.join(str(p) for p in cfg.allowed_folders('write')) or 'none'}",
             f"allowed sites: {', '.join(cfg.allowed_sites()) or 'none'}",
             f"screen: {_screen_line(svc('screen'))}",
+            f"task: {_task_line(svc('state'))}",
+            f"ui: {_ui_line(svc('ui'))}",
             f"red-keyword gate: {len(cfg.get('permissions.red_keywords', []) or [])} keywords active",
         ]
         return ToolResult.success("\n".join(lines), display="runtime summary")
@@ -334,3 +336,38 @@ def _screen_line(screen: object) -> str:
         return screen.describe()
     except Exception:
         return "available"
+
+
+def _task_line(state: object) -> str:
+    """One line about task state / crash-resume for assistant.about (stage 8)."""
+    if state is None:
+        return "not recording (state store not available)"
+    try:
+        task = getattr(state, "current", None)
+        if task is not None:
+            steps = len(getattr(task, "steps", []) or [])
+            return f"recording to {state.path} - task in progress: {task.summarize()} ({steps} step(s))"
+        interrupted = getattr(state, "interrupted", None)
+        if interrupted is not None:
+            return (
+                f"recording to {state.path} - interrupted task waiting to be resumed: "
+                f"{interrupted.summarize()}"
+            )
+        return f"recording to {state.path} - nothing in progress"
+    except Exception as exc:
+        return f"unavailable ({exc})"
+
+
+def _ui_line(ui: object) -> str:
+    """One line about the tray/overlay front ends for assistant.about (stage 8)."""
+    if ui is None:
+        return "not built"
+    try:
+        if not ui.available:
+            return f"none active ({ui.reason})"
+        status = ui.status()
+        fronts = ", ".join(getattr(front, "name", type(front).__name__) for front in ui.children)
+        detail = status.get("detail") or ""
+        return f"{fronts} - {status.get('status')}{f' ({detail})' if detail else ''}"
+    except Exception as exc:
+        return f"unavailable ({exc})"

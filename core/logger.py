@@ -30,7 +30,7 @@ import logging
 import re
 import threading
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 # --------------------------------------------------------------------------
 # Redaction - belt and braces. The permission layer refuses to read secret
@@ -163,12 +163,40 @@ class ActivityLogger:
         self.jsonl_prefix = Path(activity_jsonl_prefix).stem
         self.redactor = Redactor(redact_patterns, redaction_replacement)
         self._lock = threading.RLock()
+        self._sub_lock = threading.RLock()
+        self._subscribers: list[Any] = []
         self._session_id = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
 
     # -- paths -------------------------------------------------------------
     def _jsonl_path(self, day: _dt.date | None = None) -> Path:
         day = day or _dt.date.today()
         return self.dir / f"{self.jsonl_prefix}-{day.isoformat()}.jsonl"
+
+    # -- subscribers -------------------------------------------------------
+    def subscribe(self, callback: "Callable[[dict[str, Any]], None]") -> None:
+        """Register a callback for every event that is written.
+
+        Used by the task-state store (stage 8) and the UI: both want to see what
+        happened without re-reading the log file. A broken subscriber must never
+        break logging, so exceptions are swallowed and reported to the log only.
+        """
+        with self._sub_lock:
+            if callback not in self._subscribers:
+                self._subscribers.append(callback)
+
+    def unsubscribe(self, callback: "Callable[[dict[str, Any]], None]") -> None:
+        with self._sub_lock:
+            if callback in self._subscribers:
+                self._subscribers.remove(callback)
+
+    def _dispatch(self, record: dict[str, Any]) -> None:
+        with self._sub_lock:
+            subscribers = list(self._subscribers)
+        for callback in subscribers:
+            try:
+                callback(dict(record))
+            except Exception:
+                continue  # a bad listener is not allowed to lose a log line
 
     # -- writing -----------------------------------------------------------
     def event(
@@ -214,6 +242,7 @@ class ActivityLogger:
         if extra:
             record["extra"] = _scrub_args(extra, self.redactor, sensitive=sensitive)
 
+        self._dispatch(record)
         if not self.enabled:
             return record
 

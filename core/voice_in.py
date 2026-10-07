@@ -576,6 +576,31 @@ class Listener:
         self.activity = activity
         self.segmenter = UtteranceSegmenter.from_config(cfg)
         self.wake_phrases = [str(p) for p in (cfg.get("voice_in.wake.phrases", []) or ["garvis"])]
+        # Pause/resume is what the tray/overlay "Pause listening" button and the
+        # spoken "stop listening" both use: while paused the microphone is still
+        # open (so it can be resumed at once) but nothing is detected or recorded.
+        self._paused = threading.Event()
+
+    # -- pause / resume ----------------------------------------------------
+    @property
+    def paused(self) -> bool:
+        return self._paused.is_set()
+
+    def pause(self, reason: str = "paused by the ui") -> None:
+        self._paused.set()
+        if self.activity:
+            self.activity.event("system", f"listening paused ({reason})")
+        if self.log:
+            self.log.info("listening paused (%s)", reason)
+
+    def resume(self, reason: str = "resumed") -> None:
+        if not self._paused.is_set():
+            return
+        self._paused.clear()
+        if self.activity:
+            self.activity.event("system", f"listening resumed ({reason})")
+        if self.log:
+            self.log.info("listening resumed (%s)", reason)
 
     # -- helpers -----------------------------------------------------------
     def _collect_frames(self, frames: list[Any]) -> Any:
@@ -596,6 +621,8 @@ class Listener:
         ``first_frame`` is used by barge-in: the frame that interrupted playback
         is the first frame of the user's new utterance and must not be dropped.
         """
+        if self._paused.is_set():
+            return None
         self.segmenter = UtteranceSegmenter.from_config(self.cfg)
         started = time.time()
         frames: list[Any] = []
@@ -641,7 +668,14 @@ class Listener:
         self.wake.reset()
         started = time.time()
         best = 0.0
-        while timeout_s is None or time.time() - started < timeout_s:
+        deadline = None if timeout_s is None else time.time() + timeout_s
+        while deadline is None or time.time() < deadline:
+            if self._paused.is_set():
+                before = time.time()
+                time.sleep(0.2)          # keep the loop alive so resume is instant
+                if deadline is not None:
+                    deadline += time.time() - before   # time paused does not count
+                continue
             frame = self.mic.read_frame(timeout=0.5)
             if frame is None:
                 continue
@@ -660,8 +694,14 @@ class Listener:
         self, timeout_s: float | None, on_frame: Callable[[Any], None] | None
     ) -> ListenResult:
         """Fallback: record utterances and check their transcript for 'garvis'."""
-        started = time.time()
-        while timeout_s is None or time.time() - started < timeout_s:
+        deadline = None if timeout_s is None else time.time() + timeout_s
+        while deadline is None or time.time() < deadline:
+            if self._paused.is_set():
+                before = time.time()
+                time.sleep(0.2)
+                if deadline is not None:
+                    deadline += time.time() - before
+                continue
             recorded = self._record_utterance(min(12.0, timeout_s or 12.0))
             if not recorded:
                 continue
@@ -683,6 +723,8 @@ class Listener:
         """Record one utterance and transcribe it (no wake word needed)."""
         if not self.mic.available:
             return ListenResult(False, reason=self.mic.reason)
+        if self._paused.is_set():
+            return ListenResult(False, reason="listening is paused")
         if prompt and self.log:
             self.log.debug("listening: %s", prompt)
         start_timeout = float(self.cfg.get("voice_in.listen.start_timeout_s", 8))

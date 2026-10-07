@@ -48,7 +48,7 @@ def build_registry(
 
     builtin.register(registry, cfg, log, services)
 
-    for module_name in ("files", "shell", "browser", "screen", "apps"):
+    for module_name in ("files", "shell", "browser", "screen", "apps", "tasks"):
         try:
             if importlib.util.find_spec(f"tools.{module_name}") is None:
                 if log:

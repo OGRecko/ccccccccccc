@@ -139,6 +139,9 @@ permissions:
     # Screen: looking is free, watching your screen continuously is a question,
     # and touching the mouse or keyboard is RED.
     - {tier: green,  match: "^screen\\.(status|capture|look|guide_stop|guide_last)"}
+    # Task bookkeeping is free; resuming puts the work back in front of me.
+    - {tier: green,  match: "^task\\.(status|steps|rollback_plan|start|finish)"}
+    - {tier: yellow, match: "^task\\.resume"}
     - {tier: yellow, match: "^(files\\.(write|mkdir|move|copy)|shell\\.run|apps\\.open|browser\\.(click|type|press|close|continue)|memory\\.(note|set_profile_field)|assistant\\.set_personality|screen\\.(guide_start|move))"}
     - {tier: red,    match: "^(files\\.delete|apps\\.close|shell\\.sudo|browser\\.(login|payment|purchase)|screen\\.(click|type|press)|system\\.)"}
   # Extra keywords that force RED even if a rule says otherwise.
@@ -303,11 +306,6 @@ memory:
 # ---------------------------------------------------------------------------
 # STATE / CRASH RESUME (stage 8)
 # ---------------------------------------------------------------------------
-state:
-  dir: state
-  resume_on_start: true
-  autosave_interval_s: 5
-  keep_history: 20               # how many finished tasks to keep
 
 # ---------------------------------------------------------------------------
 # LOGGING (stage 2, required by stage 1 loop)
@@ -329,15 +327,46 @@ logging:
 # UI (stage 8): tray + overlay with status, current task, big STOP button
 # ---------------------------------------------------------------------------
 ui:
-  enabled: true
-  tray: true                     # system tray icon + menu
-  overlay: true                  # small always-on-top status window
+  enabled: true                  # false = no tray, no window, terminal messages only
+  tray: true                     # system tray icon + menu (pip install pystray pillow)
+  overlay: true                  # small always-on-top status window (needs tkinter)
   overlay_position: bottom-right # top-left | top-right | bottom-left | bottom-right
-  overlay_always_on_top: true
+  overlay_always_on_top: true    # keep the STOP button reachable
   overlay_opacity: 0.92
-  show_transcript: true          # show what was heard
+  show_transcript: true          # show what was heard and what was said
   stop_button_confirm: false     # false = the STOP button stops instantly
+  terminal_status: true          # when no tray/window works, print status lines
   theme: dark
+
+# ---------------------------------------------------------------------------
+# TASK STATE / CRASH-RESUME (stage 8)
+# ---------------------------------------------------------------------------
+state:
+  enabled: true                  # false = no task record at all (no crash-resume)
+  dir: state                     # state/task_state.json lives here
+  record_steps: true             # write down every tool call inside a task
+  history_limit: 10              # how many finished tasks to remember
+  auto_task: true                # label a task by itself when real work begins
+  resume_on_start: true          # mention unfinished work from the last run (--resume carries it on)
+  # Spoken answers that do NOT go through the model: they work even when Ollama
+  # is down, which is exactly when an unfinished task matters most. They are only
+  # used when a task is actually running or waiting to be resumed, so ordinary
+  # sentences that merely contain these words are left to the model.
+  resume_phrases:
+    - "resume"
+    - "resume the task"
+    - "carry on"
+    - "continue where you left off"
+    - "pick up where you left off"
+    - "where were we"
+    - "what were you doing"
+  rollback_phrases:
+    - "rollback plan"
+    - "roll back plan"
+    - "undo plan"
+    - "how do i undo that"
+    - "how do i undo it"
+    - "what did you change"
 
 # ---------------------------------------------------------------------------
 # SAFETY / RELIABILITY (stages 3, 5, 8)

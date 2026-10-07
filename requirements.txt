@@ -1,54 +1,87 @@
 # ============================================================================
 # GARVIS requirements
 # ----------------------------------------------------------------------------
-# Install in stages (see README) or all at once:
-#     python -m venv .venv && . .venv/bin/activate   (Windows: .venv\Scripts\activate)
-#     pip install -r requirements.txt
-#     playwright install chromium                      # stage 6
+#   python -m venv .venv
+#   . .venv/bin/activate                     (Windows: .venv\Scripts\activate)
+#   pip install -r requirements.txt
+#   playwright install chromium              # only for browser control
 #
-# NOTE: stage 1 only needs the "CORE (stage 1)" block below.
-# Heavy blocks (voice, vision, browser) are commented with the stage that needs
-# them so you can get the text brain running first, then add capabilities.
+# Grouped by feature, so you can install just what you want. Nothing here is
+# needed to read the code: every optional dependency is imported lazily and
+# GARVIS reports what is missing instead of crashing.
+#
+#   python -m pip install -r requirements.txt            # everything
+#   python -m pip install PyYAML requests                # text assistant only
+#
+# After installing:  python tests/self_test.py            # verifies all of it
 # ============================================================================
 
-# ---- CORE (stage 1) : text chat loop with Ollama ----
-PyYAML>=6.0
-requests>=2.31
+# ---- CORE (stage 1): text chat loop with Ollama ----------------------------
+PyYAML>=6.0                 # config.yaml
+requests>=2.31              # talks to the Ollama HTTP API
 
-# ---- MEMORY / LOGGING (stage 2) : stdlib only, nothing extra needed ----
+# ---- MEMORY / LOGGING (stage 2) -------------------------------------------
+# stdlib only: logging, json, re. Nothing to install.
 
-# ---- PC TOOLS (stage 4) : screenshot + optional mouse/keyboard ----
-mss>=9.0.1                 # fast cross-platform screenshots
-Pillow>=10.0.0             # image encode/annotate for the vision model
-psutil>=5.9                # process list / app close
-pyautogui>=0.9.54          # OPTIONAL: mouse+keyboard control (RED-tier, off by default)
+# ---- PERMISSIONS (stage 3) -------------------------------------------------
+# stdlib only: the gate, the confirmers and the redaction are self-contained.
 
-# ---- VOICE IN (stage 5) ----
-faster-whisper>=1.0.3      # local STT (pulls ctranslate2; first run downloads the model)
-sounddevice>=0.4.6         # mic capture
-soundfile>=0.12.1          # wav read/write
-numpy>=1.24                # audio buffers
-webrtcvad>=2.0.10          # OPTIONAL: voice-activity detection for tight end-of-speech
-openwakeword>=0.6.0        # OPTIONAL: "Garvis" wake word (see README for custom model)
-keyboard>=0.13.5           # global hotkeys (kill switch, push-to-talk) - Windows/Linux+X11
-                           # macOS: use 'pynput' instead; config.hotkeys.backend handles it
-pynput>=1.7.6              # cross-platform hotkey fallback (esp. macOS)
+# ---- PC TOOLS (stage 4): files, shell, apps --------------------------------
+# stdlib only for files and shell (shutil, subprocess, pathlib).
 
-# ---- VOICE OUT (stage 5) ----
-kokoro>=0.9.2              # OPTIONAL high-quality TTS; needs torch
-piper-tts>=1.2.0           # OPTIONAL fallback TTS, tiny + fast; needs a .onnx voice
-sounddevice>=0.4.6         # playback
-# Windows-only alternative for Kokoro/Piper audio output:
-# simpleaudio>=1.0.4
+# ---- VOICE IN (stage 5): microphone + speech-to-text ----------------------
+faster-whisper>=1.0.3       # local STT; pulls ctranslate2. First run downloads the model
+sounddevice>=0.4.6          # microphone capture AND speaker playback (PortAudio)
+numpy>=1.24                 # audio buffers and frames
+openwakeword>=0.6.0         # OPTIONAL: wake word. Without it GARVIS wakes on the
+                            #           word "garvis" in the transcript
+# Linux also needs the PortAudio library:
+#   sudo apt install libportaudio2 portaudio19-dev
 
-# ---- BROWSER (stage 6) ----
-playwright>=1.44.0         # then run: playwright install chromium
+# ---- VOICE OUT (stage 5): text-to-speech ----------------------------------
+piper-tts>=1.2.0            # DEFAULT engine: tiny, fast, offline.
+                            # Needs a voice: put NAME.onnx + NAME.onnx.json in
+                            # models/voices/ and set voice_out.voice in config.yaml
+                            # Voices: https://huggingface.co/rhasspy/piper-voices
+pyttsx3>=2.90               # OPTIONAL alternative: uses the voices your OS already
+                            # has (espeak-ng on Linux, SAPI on Windows, say on macOS)
+# kokoro>=0.9.2             # OPTIONAL, heavy (~2 GB with PyTorch), best quality.
+                            # Uncomment, add the model files in models/kokoro/,
+                            # set voice_out.engine: kokoro in config.yaml
+# simpleaudio>=1.0.4        # OPTIONAL Windows playback backend if sounddevice
+                            # will not open a device
 
-# ---- UI (stage 8) ----
-pystray>=0.19.5            # system tray
-Pillow>=10.0.0             # tray icon rendering
-pillow>=10.0.0
-# tkinter ships with CPython; on Debian/Ubuntu: sudo apt install python3-tk
+# ---- GLOBAL HOTKEYS (stages 5, 8) -----------------------------------------
+keyboard>=0.13.5            # Ctrl+Alt+Esc kill switch: Windows / Linux-X11.
+                            # Linux needs root or uinput access; Wayland does not
+                            # allow global hotkeys at all
+pynput>=1.7.6               # macOS hotkeys, and a cross-platform fallback
 
-# ---- DEV / TESTS ----
+# ---- BROWSER (stage 6) -----------------------------------------------------
+playwright>=1.44.0          # then: playwright install chromium  (downloads ~150 MB)
+
+# ---- SCREEN / VISION (stage 7) --------------------------------------------
+mss>=9.0.1                  # fast cross-platform screen capture (X11 works out of
+                            # the box; on Wayland it usually needs a portal)
+Pillow>=10.0.0              # image handling for capture and the tray icon
+pyautogui>=0.9.54           # OPTIONAL: mouse/keyboard control. RED-tier and
+                            # disabled unless screen.allow_control: true
+# Linux alternatives GARVIS can use if mss fails: grim, scrot, ImageMagick
+#   sudo apt install scrot imagemagick
+
+# ---- TRAY / OVERLAY UI (stage 8) ------------------------------------------
+pystray>=0.19.5             # system tray icon with the STOP button
+# Pillow is listed above and is also what draws the tray icon.
+# tkinter is the overlay: it ships with CPython.
+#   Linux (Debian/Ubuntu): sudo apt install python3-tk
+#   Fedora:                sudo dnf install python3-tkinter
+
+# ---- TASK STATE / CRASH-RESUME (stage 8) ----------------------------------
+# stdlib only: json + os.replace for the atomic state file.
+
+# ---- SELF-TEST (stage 9) --------------------------------------------------
+# stdlib only: it imports the real modules and reports what is missing.
+
+# ---- DEV / TESTS -----------------------------------------------------------
 pytest>=8.0
+pyflakes>=3.2               # OPTIONAL: the lint pass used during development

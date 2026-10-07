@@ -392,7 +392,10 @@ def check_permissions_wired(ctx: Ctx) -> Result:
 def check_sandbox(ctx: Ctx) -> Result:
     app = ctx.services()
     gate = app.gate
-    sandbox = ctx.cfg.resolve_path(str(ctx.cfg.get("files.sandbox_dir", "sandbox")))
+    # The app's own (temp) sandbox: the self-test must not write into the real one.
+    sandbox = Path(str(app.cfg.get("files.sandbox_dir")))
+    if not sandbox.is_absolute():
+        sandbox = app.cfg.resolve_path(sandbox)
     sandbox.mkdir(parents=True, exist_ok=True)
 
     name = "self-test-note.txt"

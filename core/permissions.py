@@ -89,11 +89,58 @@ class ConfirmRequest:
     mode: str = "spoken"  # spoken | click | either | both
     stage: str = "single"  # single | repeat | confirm
     require_phrase: str = "confirm"
+    #: The same action described in words, for channels that listen instead of
+    #: read ("delete the file voice-demo.txt"). Spoken repeats are checked
+    #: against this; typing at the console still uses ``exact``.
+    challenge_spoken: str = ""
+    #: True when the call carries a secret: channels that would speak the
+    #: challenge aloud must abstain (see VoiceConfirmer).
+    sensitive: bool = False
 
     @property
     def challenge(self) -> str:
-        """For stage='repeat': the string the user must reproduce exactly."""
+        """The string the user must reproduce for stage='repeat'."""
         return self.exact
+
+    def match_repeat(self, heard: str) -> tuple[bool, str]:
+        """Check a repeat for this request. Returns (matched, why_not).
+
+        Two accepted forms, both strict about *what* is being approved:
+
+        1. the machine form typed exactly (``files.delete path=voice-demo.txt``),
+           which is what the console shows;
+        2. the spoken form (``delete the file voice demo dot txt``), matched on
+           significant words only, so speech-to-text noise like "dot" or an
+           added "the file" does not block a legitimate confirmation.
+
+        A negation anywhere in the repeat ("do not delete ...") never matches,
+        and a repeat that drops the target does not match either.
+        """
+        if not heard or not str(heard).strip():
+            return False, "nothing was repeated"
+        if _norm(heard) == _norm(self.exact):
+            return True, ""
+        if self.challenge_spoken and _norm(heard) == _norm(self.challenge_spoken):
+            return True, ""
+
+        heard_tokens = _significant_tokens(heard)
+        if not heard_tokens:
+            return False, "nothing recognisable was repeated"
+        if _is_negated(heard):
+            return False, "the repeat contained a negation"
+
+        best_gap = 1.0
+        for candidate in filter(None, (self.challenge_spoken, self.exact)):
+            want = _significant_tokens(candidate)
+            if not want:
+                continue
+            missing = [token for token in want if token not in heard_tokens]
+            gap = len(missing) / len(want)
+            best_gap = min(best_gap, gap)
+            if not missing:
+                return True, ""
+        detail = f" (missing: {', '.join(sorted(set(want) - set(heard_tokens)))[:60]})" if best_gap < 1 else ""
+        return False, "the repeated action did not match" + detail
 
 
 @dataclass
@@ -102,6 +149,10 @@ class ConfirmAnswer:
     method: str = "none"        # console | voice | ui | scripted
     text: str = ""              # what the user actually said/typed
     timed_out: bool = False
+    #: True when this channel could not handle the request (wrong medium,
+    #: e.g. a secret challenge on voice). The chain then tries the next one
+    #: instead of treating it as a refusal.
+    unavailable: bool = False
     note: str = ""
 
     @property
@@ -135,6 +186,7 @@ class ConfirmerChain:
         if not self.confirmers:
             return ConfirmAnswer(False, note="no confirmer available (denied by default)")
         last = ConfirmAnswer(False, note="no confirmer answered")
+        abstained: list[str] = []
         for confirmer in self.confirmers:
             if not getattr(confirmer, "available", True):
                 continue
@@ -143,20 +195,52 @@ class ConfirmerChain:
             except Exception as exc:  # a broken channel must never approve anything
                 last = ConfirmAnswer(False, note=f"{confirmer.name} failed: {exc}")
                 continue
+            if answer.unavailable:
+                # Remember *why* so the denial can explain itself to the user.
+                if answer.note:
+                    abstained.append(f"{confirmer.name}: {answer.note}")
             if answer.approved:
                 answer.method = answer.method or confirmer.name
                 return answer
             last = answer
-            if answer.timed_out:
-                continue  # no answer here; try the next channel
+            if answer.timed_out or answer.unavailable:
+                continue  # this channel could not answer; try the next one
             if answer.method and answer.method != "none":
                 return answer  # a clear "no" ends the chain
+        if abstained:
+            last.note = "; ".join([last.note] + abstained)
         return last
 
 
 def _norm(text: str) -> str:
     """Normalise a spoken/typed confirmation for comparison."""
     return " ".join(str(text or "").lower().split()).strip(" .,!?\"'").strip()
+
+
+#: Words speech-to-text adds or drops around punctuation and filenames. They
+#: carry no meaning for *which action* is being approved, so they are ignored
+#: when comparing a spoken repeat against the challenge. Extensions are NOT
+#: in here: "notes.txt" and "notes.md" must stay different.
+_SPEECH_NOISE = {
+    "dot", "dash", "hyphen", "underscore", "slash", "equals", "period",
+    "the", "a", "an", "to", "of", "for", "and", "then", "that", "this",
+    "please", "garvis", "file", "folder", "path", "command", "ok", "okay",
+}
+_NEGATIONS = {"not", "dont", "don", "no", "never", "cancel", "abort", "stop"}
+
+
+def _significant_tokens(text: str) -> set[str]:
+    """Meaningful words of a phrase, with speech noise and punctuation removed."""
+    cleaned = re.sub(r"[^a-z0-9]+", " ", str(text or "").lower())
+    return {token for token in cleaned.split() if token and token not in _SPEECH_NOISE}
+
+
+def _is_negated(text: str) -> bool:
+    cleaned = re.sub(r"[^a-z0-9]+", " ", str(text or "").lower())
+    tokens = set(cleaned.split())
+    if tokens & _NEGATIONS:
+        return True
+    return bool(re.search(r"\bdo\s+not\b|\bdon'?t\b|\bn't\b", str(text or ""), re.IGNORECASE))
 
 
 class ConsoleConfirmer:
@@ -204,8 +288,10 @@ class ConsoleConfirmer:
         wait_note = "Ctrl+C to deny" if self.interactive else f"timeout {request.timeout_s:.0f}s"
 
         if request.stage == "repeat":
-            print("\n  Step 1 of 2 - repeat this exactly to show it is really you:")
+            print("\n  Step 1 of 2 - repeat this to show it is really you:")
             print(f"      {exact}")
+            if request.challenge_spoken and _norm(request.challenge_spoken) != _norm(exact):
+                print(f"      (or say: \"{request.challenge_spoken}\")")
             print(f"  ({wait_note})")
             print("-" * 72)
             text = self._ask("repeat> ", request.timeout_s)
@@ -991,6 +1077,10 @@ class PermissionGate:
         exact = _exact_action(tool, display_args)
         if tier == RED:
             return self._confirm_red(tool, args, summary, exact, reasons, sensitive=sensitive)
+        # Yellow: ask out loud in words, not in machine syntax. The console (and
+        # the UI) still show the exact arguments for a precise decision.
+        human = _spoken_challenge(tool, display_args)
+        self._spoken_summary = human
 
         cfg = self.yellow_cfg
         request = ConfirmRequest(
@@ -1007,7 +1097,7 @@ class PermissionGate:
             tool=tool.name, args=args, tier=tier, decision="asked",
             note=" | ".join(reasons) if reasons else "", sensitive=sensitive,
         )
-        self._notify(f"{summary}. Say yes to approve.")
+        self._notify(f"About to {human}. Say yes to approve.")
         if self.confirmer is None:
             return ConfirmAnswer(False, note="no confirmation channel is configured")
         return self.confirmer.confirm(request)
@@ -1034,31 +1124,40 @@ class PermissionGate:
                 tier=RED, tool=tool.name, summary=summary, exact=exact,
                 reasons=base_reasons, timeout_s=timeout_s,
                 mode=str(cfg.get("mode", "both")), stage="repeat", require_phrase=require_phrase,
+                sensitive=sensitive,
             )
+            step1.challenge_spoken = _spoken_challenge(tool, args)
             self._record(tool=tool.name, args=args, tier=RED, decision="asked",
                          note="RED step 1/2: repeat the exact action", sensitive=sensitive)
             self._notify(
-                f"I need explicit approval: {summary}. Step one: repeat it back to me exactly."
+                f"This is a red action: {step1.challenge_spoken}. "
+                f"Step one, repeat that back to me word for word."
             )
             answer1 = self.confirmer.confirm(step1)
             method = answer1.method or "none"
             if not answer1.approved:
+                # Carry the channel's own explanation through, so the user is told
+                # *why* (e.g. "this action carries a secret; confirm on screen").
+                detail = f" ({answer1.note})" if answer1.note else ""
                 return ConfirmAnswer(
                     False, method=method, text=answer1.text, timed_out=answer1.timed_out,
-                    note="RED step 1: no answer / refused",
+                    note=f"RED step 1: no answer / refused{detail}",
                 )
-            if _norm(answer1.text) != _norm(exact):
+            matched, why_not = step1.match_repeat(answer1.text)
+            if not matched:
                 self._record(tool=tool.name, args=args, tier=RED, decision=DENIED,
-                             note="RED step 1: repeated wording did not match", sensitive=sensitive)
+                             note=f"RED step 1: repeated wording did not match ({why_not})",
+                             sensitive=sensitive)
                 return ConfirmAnswer(
                     False, method=method, text=answer1.text,
-                    note=f"RED step 1: the repeated action did not match ('{answer1.text[:60]}')",
+                    note=f"RED step 1: {why_not} (heard: '{answer1.text[:60]}')",
                 )
 
         step2 = ConfirmRequest(
             tier=RED, tool=tool.name, summary=summary, exact=exact,
             reasons=base_reasons, timeout_s=timeout_s,
             mode=str(cfg.get("mode", "both")), stage="confirm", require_phrase=require_phrase,
+            sensitive=sensitive,
         )
         self._record(tool=tool.name, args=args, tier=RED, decision="asked",
                      note="RED step 2/2: say the confirmation word", sensitive=sensitive)
@@ -1070,9 +1169,10 @@ class PermissionGate:
         answer2 = self.confirmer.confirm(step2)
         method = f"{method}+{answer2.method}" if method not in ("none", answer2.method) else answer2.method
         if not answer2.approved:
+            detail = f" ({answer2.note})" if answer2.note else ""
             return ConfirmAnswer(
                 False, method=method, text=answer2.text, timed_out=answer2.timed_out,
-                note="RED step 2: no answer / refused",
+                note=f"RED step 2: no answer / refused{detail}",
             )
         if _norm(answer2.text) != _norm(require_phrase):
             self._record(tool=tool.name, args=args, tier=RED, decision=DENIED,
@@ -1210,6 +1310,24 @@ def _first_token(command: str) -> str:
     except ValueError:
         parts = command.split()
     return parts[0] if parts else ""
+
+
+def _spoken_challenge(tool: Any, args: dict[str, Any]) -> str:
+    """Describe an action in words, for the spoken RED repeat-back check."""
+    spoken_action = getattr(tool, "spoken_action", None)
+    if callable(spoken_action):
+        try:
+            phrase = str(spoken_action(args) or "").strip()
+            if phrase:
+                return phrase
+        except Exception:
+            pass
+    verb = tool.name.split(".")[-1].replace("_", " ")
+    values = [
+        str(value) for value in args.values()
+        if isinstance(value, (str, int, float)) and str(value).strip()
+    ][:2]
+    return " ".join([verb] + values).strip()
 
 
 def mask_secrets(args: dict[str, Any], mask: str = "***") -> dict[str, Any]:

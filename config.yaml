@@ -70,7 +70,8 @@ voice_out:
   sentence_chunking: true      # stream LLM output -> speak sentence by sentence
   min_chunk_chars: 12          # do not speak fragments shorter than this
   max_chunk_chars: 220         # force-flush long sentences at punctuation
-  allow_barge_in: true         # interrupt GARVIS by speaking over it (stage 12)
+  allow_barge_in: true         # interrupt GARVIS by speaking over it
+  max_wait_s: 120              # how long the text loop waits for speech to finish
 
 # ---------------------------------------------------------------------------
 # VOICE IN - speech to text + wake word (stage 5)
@@ -81,9 +82,13 @@ voice_in:
   input_device: default        # mic name/index, "default" = system default
   stt:
     engine: faster_whisper
-    model: distil-large-v3     # base.en / small.en / medium.en / large-v3 / distil-large-v3
-    device: auto               # auto | cpu | cuda
-    compute_type: auto         # auto | int8 | float16  (int8 = best on CPU)
+    # Model size is the main latency/accuracy trade-off. Guidance:
+    #   CPU only, 8 GB RAM    -> base.en or small.en          (~0.5-1.5 s per phrase)
+    #   CPU only, 16+ GB RAM  -> distil-large-v3              (~1-3 s, much better)
+    #   NVIDIA GPU, 6+ GB     -> distil-large-v3 or large-v3  (<0.5 s, best)
+    model: distil-large-v3
+    device: auto               # auto | cpu | cuda  (auto picks CUDA when torch sees a GPU)
+    compute_type: auto         # auto | int8 | float16 | int8_float16 (int8 = best on CPU)
     language: en
     beam_size: 1               # 1 = fastest, 5 = most accurate
     vad_filter: true           # drop silence, big speed win
@@ -95,9 +100,15 @@ voice_in:
   wake:
     enabled: true
     engine: openwakeword       # openwakeword | porcupine | none (push-to-talk only)
-    model: garvis              # built-in name or a path to your custom .tflite/.onnx
+    # "garvis" is not a stock openWakeWord model. Either:
+    #   a) put a custom model file somewhere and point this at it, e.g. models/wake/garvis.onnx
+    #   b) leave it as "garvis" and GARVIS falls back to builtin_fallback below
+    #   c) set engine to none: GARVIS then transcribes everything and wakes when
+    #      "garvis ..." appears in the transcript (slower, no extra training)
+    # Training a custom model: https://github.com/dscripka/openWakeWord (see README)
+    model: garvis
     builtin_fallback: hey_jarvis   # used if the custom "garvis" model is absent
-    threshold: 0.5
+    threshold: 0.5                 # raise it if GARVIS wakes from background noise
     # Wake phrases that are also accepted as plain text at the start of a command
     phrases: ["garvis", "hey garvis", "okay garvis"]
 
@@ -193,6 +204,20 @@ shell:
     - ">:.*\\\\.(ssh|aws)"
     - "chmod\\s+777\\s+/"
   env_allow: [PATH, HOME, USERPROFILE, TEMP, TMP, LANG, SYSTEMROOT, USERNAME]
+
+# ---------------------------------------------------------------------------
+# APPS - opening and closing programs (stage 5)
+# ---------------------------------------------------------------------------
+apps:
+  # apps.open only launches programs whose name appears here (match is on the
+  # executable name, case-insensitive, without .exe). Files, folders and URLs
+  # are opened with the OS default handler instead.
+  allowlist: [notepad, calc, explorer, code, chrome, firefox, msedge, terminal,
+              gnome-terminal, konsole, xterm, textedit, finder, spotify, vlc,
+              taskmgr, cmd.exe, powershell]
+  close_tier: red                # closing a program can lose unsaved work -> RED
+  # Never killable, whatever you approve:
+  protected: [explorer, systemd, launchd, gnome-shell, plasmashell, garvis, python]
 
 # ---------------------------------------------------------------------------
 # BROWSER - Playwright, one persistent profile per account (stage 6)

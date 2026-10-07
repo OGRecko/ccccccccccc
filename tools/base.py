@@ -92,6 +92,10 @@ class Tool:
     #: Optional extra check: guard(args) -> (tier_to_promote_to | None, reason).
     #: Tools use it for checks only they can do (e.g. "this selector is a Pay button").
     guard: "Callable[[dict[str, Any]], tuple[str | None, str]] | None" = None
+    #: How to describe this action *out loud* for the RED repeat-back check,
+    #: e.g. lambda a: f"delete the file {a['path']}". Falls back to a generic
+    #: "<verb> <args>" phrase. The console form stays precise and machine-like.
+    spoken_action: "Callable[[dict[str, Any]], str] | None" = None
     #: Per-call timeout in seconds; None = safety.tool_timeout_s.
     timeout_s: float | None = None
     #: Human-facing example used by docs/UI.
@@ -197,6 +201,7 @@ class ToolRegistry:
         url_args: tuple[str, ...] = (),
         command_args: tuple[str, ...] = (),
         guard: "Callable[[dict[str, Any]], tuple[str | None, str]] | None" = None,
+        spoken_action: "Callable[[dict[str, Any]], str] | None" = None,
         timeout_s: float | None = None,
         example: str | None = None,
         log_omit: tuple[str, ...] = (),
@@ -218,6 +223,7 @@ class ToolRegistry:
                     url_args=url_args,
                     command_args=command_args,
                     guard=guard,
+                    spoken_action=spoken_action,
                     timeout_s=timeout_s,
                     example=example,
                     log_omit=log_omit,

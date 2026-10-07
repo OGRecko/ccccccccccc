@@ -49,7 +49,7 @@ from core.logger import (  # noqa: E402
 )
 from core.memory import Memory  # noqa: E402
 
-VERSION = "0.1.0-stage1"
+VERSION = "0.2.0-stage5"
 BANNER = r"""
    ____    _    ____  __     __ ___ ____
   / ___|  / \  |  _ \ \ \   / /|_ _/ ___|
@@ -72,6 +72,9 @@ class Garvis:
         self.activity = self._setup_logging()
         self.memory = Memory.from_config(cfg)
         self.memory.ensure_files()
+        #: True when the voice loop is driving: swaps in the voice confirmation
+        #: channel and lets barge-in stop speech mid-sentence.
+        self.voice_mode = bool(args.voice)
 
         self.services: dict[str, Any] = {
             "cfg": cfg,
@@ -79,12 +82,21 @@ class Garvis:
             "activity": self.activity,
             "memory": self.memory,
             "brain": None,        # filled below
-            "killswitch": None,   # stage 8
             "state": None,        # stage 8
-            "tts": None,          # stage 5
-            "browser": None,      # stage 6
             "ui": None,           # stage 8
+            "browser": None,      # stage 6
+            "tts": None,          # built in setup_voice()
+            "voice_in": None,
+            "wake": None,
+            "killswitch": None,   # built in setup_safety()
         }
+
+        # The kill switch owns the emergency stop for every code path, so it is
+        # created before anything that can be stopped.
+        from core.killswitch import KillSwitch
+
+        self.killswitch = KillSwitch(cfg, activity=self.activity, log=self.log)
+        self.services["killswitch"] = self.killswitch
 
         from tools import build_registry
 
@@ -95,6 +107,8 @@ class Garvis:
         # The gate needs the registry, and the notifier lets it speak (stage 5)
         # or print (now) about confirmations and denials.
         self.services["registry"] = self.registry
+        self.services["notifier"] = self.notify
+        self.setup_voice()
         self.services["notifier"] = self.notify
         self.gate = self._build_gate()
         self.services["gate"] = self.gate
@@ -107,6 +121,7 @@ class Garvis:
             activity=self.activity,
         )
         self.services["brain"] = self.brain
+        self._subscribe_killswitch()
         if args.personality:
             if not self.brain.set_personality(args.personality):
                 self.log.warning("could not switch personality to %r", args.personality)
@@ -142,12 +157,110 @@ class Garvis:
             log=self.log,
             registry=self.registry,
         )
+        # In voice mode the microphone answers first, so "yes" and the RED
+        # confirm word work hands-free; the console stays as the fallback.
+        listener = self.services.get("voice_in")
+        if self.voice_mode and listener is not None and getattr(listener.mic, "available", False):
+            from core.voice_in import VoiceConfirmer
+
+            gate.add_confirmer(
+                VoiceConfirmer(
+                    self.cfg, listener, voice_out=self.services.get("tts"), log=self.log,
+                    accept_words=[str(self.cfg.get("permissions.yellow_confirm.phrase", "yes"))]
+                    + [str(w) for w in (self.cfg.get("permissions.yellow_confirm.also_accept", []) or [])],
+                ),
+                first=True,
+            )
         self.log.info(
             "permission gate ready: %d confirm channels, %d red keywords",
             len(getattr(gate.confirmer, "confirmers", []) or [1]),
             len(gate.red_keywords),
         )
         return gate
+
+    # -- voice -------------------------------------------------------------
+    def setup_voice(self) -> None:
+        """Build TTS (always, so GARVIS can talk) and STT (only if enabled).
+
+        TTS is constructed even when disabled, because the kill switch and the
+        permission gate both want a handle they can call stop() on.
+        """
+        cfg = self.cfg
+        try:
+            from core.voice_out import VoiceOut
+
+            tts = VoiceOut(
+                cfg,
+                activity=self.activity,
+                log=self.log,
+                on_speak=self._on_speaking,
+            )
+            self.services["tts"] = tts
+            if tts.enabled:
+                self.log.info("voice out: %s", tts.describe())
+            if not tts.engine.available and tts.enabled:
+                self.log.warning(
+                    "no TTS engine available (%s) - GARVIS will print instead of speaking. "
+                    "See the README's voice section.", tts.engine.describe(),
+                )
+        except Exception as exc:
+            self.log.error("voice out failed to initialise: %s", exc)
+            self.services["tts"] = None
+
+        if not cfg.get("voice_in.enabled", True):
+            self.log.info("voice input disabled in config; use the text prompt")
+            return
+        try:
+            from core.voice_in import Listener, Microphone, Transcriber, WakeWordDetector
+
+            mic = Microphone(cfg, self.log)
+            transcriber = Transcriber(cfg, self.log)
+            wake = WakeWordDetector(cfg, self.log)
+            listener = Listener(cfg, mic, transcriber, wake, log=self.log, activity=self.activity)
+            self.services["voice_in"] = listener
+            self.services["wake"] = wake
+            if mic.available:
+                self.log.info("voice in: %s", listener.describe())
+            else:
+                self.log.warning("microphone unavailable: %s", mic.describe())
+        except Exception as exc:
+            self.log.error("voice input failed to initialise: %s", exc)
+
+    def _on_speaking(self, text: str) -> None:
+        """Called by TTS when an utterance actually starts."""
+        if self.cfg.get("logging.level") == "DEBUG":
+            self.log.debug("speaking: %s", text[:80])
+
+    def _subscribe_killswitch(self) -> None:
+        """Wire the emergency stop to everything it must halt.
+
+        Services are looked up when the stop *happens*, not when this runs: TTS
+        is rebuilt when the engine changes, the UI arrives in stage 8, and a
+        stale reference would mean the stop button silently did nothing.
+        """
+
+        def on_stop(event) -> None:
+            brain = self.services.get("brain")
+            if brain is not None:
+                try:
+                    brain.interrupt()
+                except Exception:
+                    self.log.debug("brain.interrupt failed during stop", exc_info=True)
+            tts = self.services.get("tts")
+            if tts is not None:
+                try:
+                    tts.stop()      # drop everything queued
+                    tts.pause()     # and refuse new speech until resume
+                except Exception:
+                    self.log.debug("tts stop failed", exc_info=True)
+            ui = self.services.get("ui")
+            if ui is not None and hasattr(ui, "set_status"):
+                try:
+                    ui.set_status("STOPPED", event.reason)
+                except Exception:
+                    self.log.debug("ui status failed", exc_info=True)
+
+        self.killswitch.subscribe(on_stop)
 
     # -- startup -----------------------------------------------------------
     def preflight(self, quiet: bool = False) -> bool:
@@ -198,9 +311,15 @@ class Garvis:
             self.log.info("permission gate: %s", "active" if self.gate else "DISABLED (fail-closed)")
         return True
 
-    def say(self, text: str) -> None:
-        """Print (stage 1) or speak (stage 5). Kept in one place for that reason."""
+    def say(self, text: str, wait: bool = True) -> None:
+        """Print and, from stage 5, also speak."""
         print(f"\n{self.cfg.assistant_name}: {text}\n")
+        tts = self.services.get("tts")
+        if tts is not None and getattr(tts, "enabled", False):
+            try:
+                tts.say(text, wait=wait)
+            except Exception:
+                self.log.debug("tts say failed", exc_info=True)
 
     def notify(self, text: str) -> None:
         """Short out-of-band remark: confirmations, denials, hard stops.
@@ -210,12 +329,14 @@ class Garvis:
         """
         tts = self.services.get("tts")
         if tts is not None and getattr(tts, "enabled", False):
+            print(f"  [{self.cfg.assistant_name.lower()} speaks] {text}")
             try:
                 tts.speak_async(text)
                 return
             except Exception:
                 self.log.debug("tts notify failed", exc_info=True)
-        print(f"  [{self.cfg.assistant_name.lower()} speaks] {text}")
+        else:
+            print(f"  [{self.cfg.assistant_name.lower()} speaks] {text}")
 
     # -- one turn ----------------------------------------------------------
     def handle_line(self, line: str, chunker: SentenceChunker | None = None) -> bool:
@@ -223,22 +344,39 @@ class Garvis:
         text = line.strip()
         if not text:
             return True
+        if chunker is None:
+            # Always have a chunker: it is what turns the token stream into
+            # speakable sentences. Callers that keep their own reuse it.
+            chunker = SentenceChunker(
+                min_chars=int(self.cfg.get("voice_out.min_chunk_chars", 12)),
+                max_chars=int(self.cfg.get("voice_out.max_chunk_chars", 220)),
+            )
 
         if text.startswith("/"):
             return self._handle_command(text)
 
+        # Spoken ways to end the session. In voice mode there is no keyboard,
+        # so "goodbye" has to work; it is not sent to the model.
+        if self.voice_mode and self._is_quit_phrase(text):
+            self.say("Shutting down. Say my name when you need me.", wait=True)
+            return False
+
         self.activity.event("user", text)
-        streamed: list[str] = []
+
+        tts = self.services.get("tts")
+        speaking = tts is not None and getattr(tts, "enabled", False)
 
         def on_event(event: BrainEvent) -> None:
             if event.kind == "delta":
-                streamed.append(event.text)
                 print(event.text, end="", flush=True)
-                # Stage 5 speaks these chunks; printing them proves the chunker
-                # splits sentences the way the voice engine will.
+                # Speak whole sentences as they appear: that is what makes the
+                # reply start quickly instead of waiting for the last token.
                 if chunker is not None:
                     for sentence in chunker.feed(event.text):
-                        self.log.debug("speakable chunk: %s", sentence)
+                        if speaking:
+                            tts.say_chunk(sentence)
+                        else:
+                            self.log.debug("speakable chunk: %s", sentence)
             elif event.kind == "tool_call":
                 print(f"\n  [tool] {event.text}({_short(event.data.get('args'))})", flush=True)
             elif event.kind == "tool_result":
@@ -250,6 +388,9 @@ class Garvis:
                 print(f"  [{event.text}]", flush=True)
             elif event.kind == "error":
                 print(f"\n  [error] {event.text}", flush=True)
+
+        if self._handle_stop_phrases(text):
+            return True
 
         started = time.perf_counter()
         try:
@@ -264,8 +405,16 @@ class Garvis:
             return True
 
         print()  # newline after streamed text
+        if chunker is not None:
+            tail = chunker.flush()
+            if tail and speaking and not result.interrupted:
+                tts.say_chunk(tail)
+        if speaking and not self.voice_mode:
+            # In text mode we still let the voice finish what it started, so a
+            # long answer does not overlap the next prompt's audio.
+            tts.wait(timeout=float(self.cfg.get("voice_out.max_wait_s", 120)))
         if result.interrupted:
-            self.say("Stopped.")
+            self.say("Stopped.", wait=False)
         elif result.error:
             self.say(f"That failed: {result.error}")
         elif not result.reply.strip():
@@ -285,6 +434,39 @@ class Garvis:
         if self.cfg.get("logging.level") == "DEBUG":
             self.log.debug("turn took %.0f ms", (time.perf_counter() - started) * 1000)
         return True
+
+    @staticmethod
+    def _is_quit_phrase(text: str) -> bool:
+        from core.killswitch import KillSwitch
+
+        normalized = KillSwitch._normalize(text)
+        return normalized in (
+            "quit", "exit", "goodbye", "good bye", "bye", "shut down", "shutdown",
+            "garvis quit", "garvis exit", "garvis goodbye", "garvis shut down",
+            "thats all", "that is all", "stand down", "garvis stand down",
+        )
+
+    def _handle_stop_phrases(self, text: str) -> bool:
+        """Spoken hard stop / resume. Handled locally, never sent to the model.
+
+        This is deliberate: a stop command that has to survive a 2-second model
+        round trip is not a stop command.
+        """
+        if self.killswitch.matches_kill_phrase(text):
+            self.killswitch.trigger(f'spoken phrase: "{text[:60]}"', source="voice")
+            self.say("Stopped everything.", wait=False)
+            return True
+        if self.killswitch.frozen:
+            if self.killswitch.matches_resume_phrase(text):
+                self.killswitch.resume("spoken resume")
+                tts = self.services.get("tts")
+                if tts is not None:
+                    tts.resume()
+                self.say("Back on. What do you need?", wait=False)
+            else:
+                self.notify("I am stopped. Say 'resume' when you want me to carry on.")
+            return True
+        return False
 
     def _handle_command(self, text: str) -> bool:
         """Local slash commands: they never reach the model."""
@@ -367,6 +549,128 @@ class Garvis:
                 print(f"\n  [internal error: {exc}] (see logs/garvis.log)\n")
         return 0
 
+    def run_voice_loop(self) -> int:
+        """Wake word -> listen -> think -> speak, until stopped.
+
+        Falls back to the text loop when there is no microphone or no whisper
+        model, rather than failing: a broken mic must not make GARVIS unusable.
+        """
+        listener = self.services.get("voice_in")
+        if listener is None or not getattr(listener.mic, "available", False):
+            reason = "no microphone" if listener is None else listener.mic.reason
+            self.say(f"I could not start voice mode ({reason}). Switching to text.", wait=False)
+            return self.run_text_loop()
+
+        self.voice_mode = True
+        if not listener.stt.load():
+            self.say(
+                f"Speech-to-text is not ready ({listener.stt.reason}). Switching to text mode.",
+                wait=False,
+            )
+            self.voice_mode = False
+            return self.run_text_loop()
+
+        chunker = SentenceChunker(
+            min_chars=int(self.cfg.get("voice_out.min_chunk_chars", 12)),
+            max_chars=int(self.cfg.get("voice_out.max_chunk_chars", 220)),
+        )
+        tts = self.services.get("tts")
+        wake = self.services.get("wake")
+        wake_phrases = [str(p) for p in (self.cfg.get("voice_in.wake.phrases", []) or ["garvis"])]
+        allow_barge_in = bool(self.cfg.get("safety.barge_in", True)) and bool(
+            self.cfg.get("voice_out.allow_barge_in", True)
+        )
+
+        self.log.info("voice mode ready: %s", listener.describe())
+        if getattr(self, "_shutdown_hotkey", None) is None:
+            self.killswitch.install_hotkey()
+            self._shutdown_hotkey = True
+
+        greeting = str(self.cfg.get("safety.startup_greeting", "Systems online."))
+        wake_name = str(self.cfg.get("app.wake_name", "Garvis"))
+        self.say(f"{greeting} Say '{wake_name}' when you need me.", wait=False)
+
+        while self.running:
+            try:
+                # Mute the wake detector while GARVIS is talking: with open
+                # speakers it would hear itself. Barge-in still works (say the
+                # wake word over the top of it) but needs a higher score.
+                while tts is not None and getattr(tts, "is_speaking", False):
+                    if not allow_barge_in:
+                        time.sleep(0.1)
+                        continue
+                    if self._barge_in_check(listener, wake_phrases):
+                        break
+                    time.sleep(0.05)
+
+                if self.killswitch.frozen:
+                    # Still listen, so "resume" works, but do not accept commands.
+                    result = listener.listen(timeout_s=6)
+                    if result.ok:
+                        self.handle_line(result.text, chunker)
+                    continue
+
+                wake_result = listener.wait_for_wake_word(timeout_s=None)
+                if not self.running:
+                    break
+                if not wake_result.ok:
+                    continue
+
+                self.activity.event("wake", f"listening after {wake_result.reason}")
+                self.notify("Yes?")
+
+                heard = listener.listen(timeout_s=float(self.cfg.get("voice_in.listen.max_utterance_s", 20)))
+                if not heard.ok:
+                    if heard.reason not in ("heard nothing", "no words recognised"):
+                        self.log.warning("listen failed: %s", heard.reason)
+                    continue
+                command = heard.text.strip()
+                if not command:
+                    continue
+                self.log.info("heard: %r", command)
+
+                if not self._wake_still_allowed(command, wake_phrases):
+                    continue
+                if self.killswitch.matches_kill_phrase(command) or self.killswitch.frozen:
+                    self.handle_line(command, chunker)
+                    continue
+
+                self.handle_line(command, chunker)
+            except KeyboardInterrupt:
+                print()
+                break
+            except Exception as exc:
+                self.log.exception("voice loop error")
+                self.activity.event("system", f"voice loop error: {exc}", ok=False)
+                time.sleep(0.5)
+        return 0
+
+    def _wake_still_allowed(self, text: str, wake_phrases: list[str]) -> bool:
+        """Drop transcripts that are clearly GARVIS's own voice echoing back."""
+        if not self.cfg.get("safety.wake_word_required", False):
+            return True
+        from core.voice_in import extract_wake_phrase
+
+        woken, _ = extract_wake_phrase(text, wake_phrases)
+        return woken
+
+    def _barge_in_check(self, listener: Any, wake_phrases: list[str]) -> bool:
+        """While speaking: stop immediately if the user says the wake word."""
+        frame = listener.mic.read_frame(timeout=0.05)
+        if frame is None:
+            return False
+        wake = self.services.get("wake")
+        if wake is None or not wake.available:
+            return False
+        threshold = float(getattr(wake, "threshold", 0.5)) * 1.5
+        if wake.score(frame) >= threshold:
+            tts = self.services.get("tts")
+            if tts is not None:
+                tts.stop()
+            self.activity.event("wake", "barge-in: wake word heard over speech")
+            return True
+        return False
+
     def shutdown(self) -> None:
         up = time.time() - self.started_at
         self.activity.event(
@@ -415,6 +719,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ollama", default=None, help="override brain.host, e.g. http://127.0.0.1:11999")
     parser.add_argument("--personality", default=None, help="start in this tone mode")
     parser.add_argument("--no-tools", action="store_true", help="chat only; the model cannot act")
+    parser.add_argument("--voice", action="store_true", help="start in voice mode (wake word + speech)")
+    parser.add_argument("--text", action="store_true", help="force the text prompt (default)")
+    parser.add_argument("--no-voice-out", action="store_true", help="print replies, do not speak them")
+    parser.add_argument("--voice-check", action="store_true",
+                        help="report TTS/STT/wake-word status and exit")
+    parser.add_argument("--say", metavar="TEXT", default=None, help="speak one phrase through the TTS engine")
+    parser.add_argument("--devices", action="store_true", help="list audio devices and exit")
     parser.add_argument("--log-level", default=None, help="DEBUG|INFO|WARNING|ERROR")
     parser.add_argument("--version", action="version", version=f"GARVIS {VERSION}")
     return parser
@@ -435,6 +746,27 @@ def main(argv: list[str] | None = None) -> int:
         cfg.set("brain.host", args.ollama)
     if args.log_level:
         cfg.set("logging.level", args.log_level.upper())
+    if args.no_voice_out:
+        cfg.set("voice_out.enabled", False)
+    if args.text:
+        cfg.set("voice_in.enabled", False)
+    if args.voice:
+        cfg.set("voice_in.enabled", True)
+
+    # Audio diagnostics need no LLM either.
+    if args.devices:
+        from core.voice_in import Microphone
+
+        devices = Microphone.list_devices()
+        if not devices:
+            print("No audio devices found (sounddevice/PortAudio missing?).")
+            return 1
+        print(f"{'idx':<4}{'in':<4}{'out':<4}{'rate':<8}name")
+        for device in devices:
+            print(f"{device['index']:<4}{device['inputs']:<4}{device['outputs']:<4}"
+                  f"{int(device['default_samplerate']):<8}{device['name']}")
+        print("\nPut a device name or index in config.yaml under voice_in.input_device / voice_out.device.")
+        return 0
 
     # --check and --today need no LLM, so they work on a bare machine.
     if args.today:
@@ -467,6 +799,24 @@ def main(argv: list[str] | None = None) -> int:
         print(app.brain.build_system_prompt())
         return 0
 
+    if args.voice_check:
+        return voice_check(app)
+
+    if args.say:
+        tts = app.services.get("tts")
+        if tts is None or not tts.enabled:
+            print("voice_out is disabled in config.yaml; nothing to speak.")
+            return 1
+        print(f"engine: {tts.describe()}")
+        print(f"speaking: {args.say!r}")
+        print(f"as spoken: {tts.preview(args.say)!r}")
+        tts.say(args.say, wait=True)
+        if tts.last_error:
+            print(f"last error: {tts.last_error}")
+            return 1
+        print("done")
+        return 0
+
     if not app.preflight():
         return 1
 
@@ -479,14 +829,65 @@ def main(argv: list[str] | None = None) -> int:
     app.activity.event(
         "system",
         f"GARVIS started (model={cfg.model}, personality={app.brain.personality}, "
-        f"gate={'on' if app.gate else 'OFF'}, tools={len(app.registry)})",
+        f"gate={'on' if app.gate else 'OFF'}, tools={len(app.registry)}, "
+        f"mode={'voice' if args.voice else 'text'})",
         extra={"version": VERSION, "python": sys.version.split()[0], "pid": os.getpid()},
     )
     try:
-        return app.run_text_loop()
+        return app.run_voice_loop() if args.voice else app.run_text_loop()
     finally:
         app.running = False
         app.shutdown()
+
+
+def voice_check(app: "Garvis") -> int:
+    """--voice-check: say clearly what works and what does not."""
+    print(f"{app.cfg.assistant_name} voice check")
+    print("-" * 60)
+
+    tts = app.services.get("tts")
+    problems = 0
+    if tts is None:
+        print("output : FAILED to initialise")
+        problems += 1
+    else:
+        print(f"output : enabled={tts.enabled} {tts.describe()}")
+        if tts.enabled and not tts.engine.available:
+            print(f"         !! {tts.engine.reason}")
+            problems += 1
+        if tts.enabled and not tts.player.available():
+            print("         !! no audio playback backend found (sounddevice/simpleaudio/aplay)")
+            problems += 1
+
+    listener = app.services.get("voice_in")
+    if listener is None:
+        print("input  : voice_in disabled")
+    else:
+        print(f"input  : {listener.describe()}")
+        if not listener.mic.available:
+            problems += 1
+        else:
+            print(f"         devices: {len(type(listener.mic).list_devices())} found "
+                  f"(use --devices to list them)")
+        if not listener.stt.load():
+            print(f"         !! speech-to-text unavailable: {listener.stt.reason}")
+            problems += 1
+        else:
+            print(f"         speech-to-text ready: {listener.stt.describe()}")
+        wake = app.services.get("wake")
+        if wake is not None:
+            print(f"wake   : {wake.describe()}")
+            if not wake.available and wake.enabled:
+                print("         (not fatal: GARVIS falls back to transcription-first wake)")
+
+    print(f"killswitch: {app.killswitch.status()}")
+    hotkey_ok = app.killswitch.install_hotkey()
+    print(f"hotkey : {'armed' if hotkey_ok else 'NOT armed (see the log for the reason)'}")
+    if not hotkey_ok:
+        print("         the spoken phrase and the STOP button still work")
+    print("-" * 60)
+    print("RESULT:", "voice ready" if problems == 0 else f"{problems} problem(s) found")
+    return 0 if problems == 0 else 1
 
 
 if __name__ == "__main__":

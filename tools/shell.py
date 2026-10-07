@@ -78,6 +78,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         category=CATEGORY,
         command_args=("command",),
         path_args=("cwd",),
+        spoken_action=lambda a: f"run the command {str(a.get('command', ''))[:100]}",
         example="shell.run(command='git status --short')",
     )
     def shell_run(command: str, cwd: str = "", timeout_s: float = 0.0, stdin_text: str = "") -> ToolResult:

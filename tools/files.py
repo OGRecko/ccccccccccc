@@ -279,6 +279,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         tier=YELLOW,
         category=CATEGORY,
         path_args=("path",),
+        spoken_action=lambda a: f"write the file {a.get('path', '')}",
         example="files.write(path='notes/todo.md', text='- ship it', mode='append')",
     )
     def files_write(path: str, text: str, mode: str = "overwrite", confirm: bool = False) -> ToolResult:
@@ -320,6 +321,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         tier=YELLOW,
         category=CATEGORY,
         path_args=("path",),
+        spoken_action=lambda a: f"create the folder {a.get('path', '')}",
     )
     def files_mkdir(path: str) -> ToolResult:
         target = resolve(path)
@@ -349,6 +351,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         tier=YELLOW,
         category=CATEGORY,
         path_args=("source", "destination"),
+        spoken_action=lambda a: f"copy {a.get('source', '')} to {a.get('destination', '')}",
         guard=lambda args: (
             (
                 RED,
@@ -399,6 +402,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         tier=YELLOW,
         category=CATEGORY,
         path_args=("source", "destination"),
+        spoken_action=lambda a: f"move {a.get('source', '')} to {a.get('destination', '')}",
         guard=lambda args: (
             (
                 RED,
@@ -448,6 +452,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         tier=RED,
         category=CATEGORY,
         path_args=("path",),
+        spoken_action=lambda a: f"delete the file {a.get('path', '')}",
         guard=lambda args: (
             ("blocked", "refusing to delete a whole allowlisted root folder")
             if str(args.get("path", "")).strip() in (".", "/", "", "~")

@@ -637,11 +637,7 @@ class UIManager(BaseUI):
         self.reasons: list[str] = []
         if not self.enabled:
             # ui.enabled: false means *nothing* is displayed, injected or not.
-            self.tray = self.overlay = None
-            self.children = []
-            self.available = False
-            self.reason = "disabled in config.yaml (ui.enabled: false)"
-            self.fallback = None
+            self.disable("disabled in config.yaml (ui.enabled: false)")
             return
         if self.tray is None and self.want_tray:
             self.tray = TrayUI(cfg, log, **kwargs)
@@ -669,6 +665,19 @@ class UIManager(BaseUI):
                 self._subscribed = True
             except Exception:
                 pass
+
+    def disable(self, reason: str = "disabled") -> None:
+        """Show nothing at all: no tray, no window, no terminal line.
+
+        Used by ``ui.enabled: false`` and by ``--no-ui``; the status the rest of
+        the app sets is still kept, it is simply never displayed.
+        """
+        self.enabled = False
+        self.tray = self.overlay = None
+        self.children = []
+        self.available = False
+        self.fallback = None
+        self.reason = reason
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> None:

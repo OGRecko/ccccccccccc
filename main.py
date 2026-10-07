@@ -346,7 +346,7 @@ class Garvis:
                 on_quit=self._ui_quit,
             )
             if self.args.no_ui:
-                ui.enabled = False
+                ui.disable("disabled by --no-ui")
             self.services["ui"] = ui
             ui.start()
             if ui.available:

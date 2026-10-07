@@ -20,7 +20,18 @@ from typing import Any
 import pytest
 
 from core.state import StateStore, is_state_changing, undo_hint
-from core.ui import IDLE, PAUSED, STOPPED, UIManager, FakeUI, NullUI, OverlayUI, TrayUI, UIState
+from core.ui import (
+    IDLE,
+    PAUSED,
+    STOPPED,
+    THINKING,
+    FakeUI,
+    NullUI,
+    OverlayUI,
+    TrayUI,
+    UIManager,
+    UIState,
+)
 from core.permissions import ALLOWED, CONFIRMED, PermissionGate, ScriptedConfirmer
 from tools import build_registry
 
@@ -721,3 +732,13 @@ def test_the_phrases_are_configurable(cfg, interrupted_app) -> None:
     cfg.set("state.resume_phrases", ["back to work"])
     assert interrupted_app._handle_task_phrases("resume") is False
     assert interrupted_app._handle_task_phrases("back to work") is True
+
+def test_a_disabled_or_no_ui_manager_really_shows_nothing(cfg) -> None:
+    ui = UIManager(cfg, tray=FakeUI(cfg), overlay=FakeUI(cfg))
+    assert ui.children, "sanity: there is a front end to begin with"
+    ui.set_status(IDLE, "before")
+    ui.disable("disabled by --no-ui")
+    assert ui.children == [] and ui.available is False and ui.tray is None
+    assert ui.describe() == "ui: none (disabled by --no-ui)", ui.describe()
+    ui.set_status(THINKING, "after")          # still safe: nothing is displayed
+    assert ui.status()["status"] == THINKING  # but the state is kept

@@ -92,7 +92,12 @@ class Garvis:
         if args.no_tools:
             self.log.warning("tools disabled by --no-tools; the model cannot act this run")
 
+        # The gate needs the registry, and the notifier lets it speak (stage 5)
+        # or print (now) about confirmations and denials.
+        self.services["registry"] = self.registry
+        self.services["notifier"] = self.notify
         self.gate = self._build_gate()
+        self.services["gate"] = self.gate
 
         self.brain = Brain(
             cfg=cfg,
@@ -135,8 +140,13 @@ class Garvis:
             activity=self.activity,
             services=self.services,
             log=self.log,
+            registry=self.registry,
         )
-        self.services["gate"] = gate
+        self.log.info(
+            "permission gate ready: %d confirm channels, %d red keywords",
+            len(getattr(gate.confirmer, "confirmers", []) or [1]),
+            len(gate.red_keywords),
+        )
         return gate
 
     # -- startup -----------------------------------------------------------
@@ -191,6 +201,21 @@ class Garvis:
     def say(self, text: str) -> None:
         """Print (stage 1) or speak (stage 5). Kept in one place for that reason."""
         print(f"\n{self.cfg.assistant_name}: {text}\n")
+
+    def notify(self, text: str) -> None:
+        """Short out-of-band remark: confirmations, denials, hard stops.
+
+        Wired into the permission gate as ``services['notifier']`` so the gate can
+        tell the user what it is waiting for without going through the model.
+        """
+        tts = self.services.get("tts")
+        if tts is not None and getattr(tts, "enabled", False):
+            try:
+                tts.speak_async(text)
+                return
+            except Exception:
+                self.log.debug("tts notify failed", exc_info=True)
+        print(f"  [{self.cfg.assistant_name.lower()} speaks] {text}")
 
     # -- one turn ----------------------------------------------------------
     def handle_line(self, line: str, chunker: SentenceChunker | None = None) -> bool:

@@ -20,11 +20,17 @@ CATEGORY = "assistant"
 
 
 def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[str, Any] | None = None) -> None:
-    services = services or {}
-    memory = services.get("memory")
-    activity = services.get("activity")
-    brain = services.get("brain")
-    killswitch = services.get("killswitch")
+    """Register the builtin tools.
+
+    ``services`` is looked up *at call time*, never captured: the registry is
+    built before the brain, kill switch and TTS exist, and those services are
+    attached to the same dict afterwards. Capturing them here would leave the
+    tools holding stale ``None`` references.
+    """
+    services = services if services is not None else {}
+
+    def svc(name: str) -> Any:
+        return services.get(name)
 
     # ------------------------------------------------------------------ clock
     def _localhost() -> str:
@@ -95,6 +101,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         example="memory.read(what='project_log', tail_lines=40)",
     )
     def memory_read(what: str = "both", tail_lines: int = 80) -> ToolResult:
+        memory = svc("memory")
         if memory is None:
             return ToolResult.failure("Memory is not available in this session.")
         what = (what or "both").lower()
@@ -141,6 +148,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         example="memory.note(text='Finished the router config; SSID unchanged')",
     )
     def memory_note(text: str, section: str = "Log") -> ToolResult:
+        memory = svc("memory")
         if memory is None:
             return ToolResult.failure("Memory is not available in this session.")
         clean = " ".join(str(text).split())
@@ -168,6 +176,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         example="memory.set_profile_field(field='Voice', value='am_onyx, pace 1.0')",
     )
     def memory_set_field(field: str, value: str) -> ToolResult:
+        memory = svc("memory")
         if memory is None:
             return ToolResult.failure("Memory is not available in this session.")
         if memory.set_profile_field(str(field), str(value)):
@@ -196,6 +205,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         example="activity.today(limit=30)",
     )
     def activity_today(limit: int = 25) -> ToolResult:
+        activity = svc("activity")
         if activity is None:
             return ToolResult.failure("Activity log is not available in this session.")
         report = activity.today_report(limit=max(1, min(int(limit or 25), 200)))
@@ -224,6 +234,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         example="assistant.set_personality(mode='sassy')",
     )
     def set_personality(mode: str) -> ToolResult:
+        brain = svc("brain")
         if brain is None:
             return ToolResult.failure("Brain is not available in this session.")
         if brain.set_personality(mode):
@@ -255,6 +266,8 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         example="assistant.stop(reason='user asked to abort')",
     )
     def assistant_stop(reason: str = "requested") -> ToolResult:
+        brain = svc("brain")
+        killswitch = svc("killswitch")
         if brain is not None:
             brain.interrupt()
         if killswitch is not None:
@@ -298,7 +311,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
             f"name: {cfg.assistant_name} (user: {cfg.user_name})",
             f"model: {cfg.model} via {cfg.ollama_host}",
             f"vision model: {cfg.vision_model}",
-            f"personality: {brain.personality if brain else cfg.personality}",
+            f"personality: {svc('brain').personality if svc('brain') else cfg.personality}",
             f"cloud fallback: {'ENABLED' if cfg.cloud_fallback_enabled else 'disabled (all local)'}",
             f"voice out: {cfg.get('voice_out.engine')} / {cfg.get('voice_out.voice')}",
             f"allowed read folders: {', '.join(str(p) for p in cfg.allowed_folders('read')) or 'none'}",

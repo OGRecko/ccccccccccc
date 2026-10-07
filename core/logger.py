@@ -40,6 +40,10 @@ from typing import Any, Iterable
 
 DEFAULT_REDACT_PATTERNS: tuple[str, ...] = (
     r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|apikey|bearer|authorization)\b\s*[:=]\s*\S+",
+    # JSON-ish forms, e.g. {"password": "hunter2"} or password: hunter2
+    r'(?i)"?\b(password|passwd|pwd|secret|token|api[_-]?key|apikey|bearer|authorization|otp|totp|cvv)\b"?\s*[:=]\s*"?[^",}\s]+',  
+    r'(?i)\b\d{3}-?\d{2}-?\d{4}\b',          # US SSN shape
+    r"\b(?:\d[ -]?){13,19}\b",                    # card-number shape
     r"(?i)\bcard\s*(number|no\.?)\b\s*[:=]?\s*[0-9][0-9 \-]{10,}",
     r"\bgh[pousr]_[A-Za-z0-9]{16,}\b",
     r"\bsk-[A-Za-z0-9]{16,}\b",
@@ -100,16 +104,22 @@ _SENSITIVE_KEYS = {
 }
 
 
-def _scrub_args(args: Any, redactor: Redactor) -> Any:
-    """Redact secrets from a nested args structure, by key name and by value."""
+def _scrub_args(args: Any, redactor: Redactor, sensitive: bool = False) -> Any:
+    """Redact secrets from a nested args structure, by key name and by value.
+
+    ``sensitive=True`` is used when the permission gate has flagged the whole
+    call as secret-bearing (e.g. a red keyword appeared in the arguments): every
+    value is then replaced by a length-tagged marker, so the log still shows
+    *that* something was passed without showing what.
+    """
     if args is None:
         return {}
     if isinstance(args, dict):
         out: dict[str, Any] = {}
         for key, value in args.items():
             key_l = str(key).lower()
-            if any(s in key_l for s in _SENSITIVE_KEYS):
-                out[key] = "[REDACTED]"
+            if any(s in key_l for s in _SENSITIVE_KEYS) or sensitive:
+                out[key] = _redacted_marker(value)
             else:
                 out[key] = _scrub_args(value, redactor)
         return out
@@ -118,6 +128,14 @@ def _scrub_args(args: Any, redactor: Redactor) -> Any:
     if isinstance(args, str):
         return redactor(args)
     return args
+
+
+def _redacted_marker(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, (list, tuple, dict)):
+        return f"[REDACTED {len(value)} item(s)]"
+    return f"[REDACTED {len(str(value))} chars]"
 
 
 def _truncate(text: str, limit: int = 4000) -> str:
@@ -166,6 +184,7 @@ class ActivityLogger:
         tier: str | None = None,
         decision: str | None = None,
         extra: dict[str, Any] | None = None,
+        sensitive: bool = False,
     ) -> dict[str, Any]:
         """Record one event. Returns the record that was written."""
         now = _dt.datetime.now(_dt.timezone.utc).astimezone()
@@ -177,7 +196,7 @@ class ActivityLogger:
         }
         if tool:
             record["tool"] = tool
-        scrubbed = _scrub_args(args, self.redactor)
+        scrubbed = _scrub_args(args, self.redactor, sensitive=sensitive)
         if scrubbed:
             record["args"] = scrubbed
         if account:
@@ -193,7 +212,7 @@ class ActivityLogger:
         if decision:
             record["decision"] = decision
         if extra:
-            record["extra"] = _scrub_args(extra, self.redactor)
+            record["extra"] = _scrub_args(extra, self.redactor, sensitive=sensitive)
 
         if not self.enabled:
             return record
@@ -249,6 +268,7 @@ class ActivityLogger:
         duration_ms: float | None = None,
         account: str | None = None,
         tier: str | None = None,
+        sensitive: bool = False,
     ) -> dict[str, Any]:
         status = "ok" if ok else ("failed" if ok is False else "ran")
         return self.event(
@@ -261,14 +281,24 @@ class ActivityLogger:
             duration_ms=duration_ms,
             account=account,
             tier=tier,
+            sensitive=sensitive,
         )
 
-    def permission(self, tool: str, args: Any, tier: str, decision: str, note: str = "") -> dict[str, Any]:
+    def permission(
+        self,
+        tool: str,
+        args: Any,
+        tier: str,
+        decision: str,
+        note: str = "",
+        sensitive: bool = False,
+    ) -> dict[str, Any]:
         message = f"permission {decision}: {tool} is {tier.upper()}"
         if note:
             message += f" ({note})"
         return self.event(
-            KIND_PERMISSION, message, tool=tool, args=args, tier=tier, decision=decision
+            KIND_PERMISSION, message, tool=tool, args=args, tier=tier,
+            decision=decision, sensitive=sensitive,
         )
 
     # -- reporting (requirement 8: "what did you do today") ----------------

@@ -91,6 +91,11 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
     if close_tier not in ("yellow", "red"):
         close_tier = RED
     self_names = {"garvis", "main.py", "python", "python3", "pythonw"}
+    # apps.protected EXTENDS the built-in list; it cannot shrink it. Configuring
+    # `protected: []` does not make sshd or explorer killable - the list above
+    # is the last word on the programs that keep the session (and the machine)
+    # alive.
+    protected = NEVER_KILL | {str(n).strip().lower() for n in (cfg.get("apps.protected", []) or []) if str(n).strip()}
 
     def _safe_to_kill(name: str) -> tuple[bool, str]:
         base = os.path.basename(str(name)).lower()
@@ -98,7 +103,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
             base = base[:-4]
         if not base:
             return False, "no process name given"
-        if base in NEVER_KILL or base in self_names:
+        if base in protected or base in self_names:
             return False, f"'{base}' is protected: killing it would break your session or GARVIS itself"
         return True, ""
 
@@ -162,7 +167,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         lines = [
             "launchable (apps.allowlist): " + (", ".join(allowlist) if allowlist else "(none - opening is refused)"),
             f"closing apps requires: {close_tier.upper()} approval",
-            "protected from closing: " + ", ".join(sorted(NEVER_KILL)[:20]) + ", ...",
+            "protected from closing: " + ", ".join(sorted(protected)[:20]) + ", ...",
             f"platform: {'windows' if IS_WINDOWS else 'macos' if IS_MAC else 'linux'}",
         ]
         return ToolResult.success("\n".join(lines), display="app rules")

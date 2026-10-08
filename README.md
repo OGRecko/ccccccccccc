@@ -89,6 +89,9 @@ Being straight with you matters more than looking impressive:
   undo what it did (newest first) and can do those steps through the normal,
   confirmed tools. It will not silently undo things by itself, it cannot bring
   back a deleted file, and if a step has no automatic inverse it says so.
+- **Only one global hotkey exists** (`Ctrl+Alt+Esc`, stop everything). Push-to-talk,
+  personality-cycle and screenshot hotkeys were never implemented; the settings for
+  them were removed rather than left in `config.yaml` pretending to work.
 - **It is only as good as the model you run.** A 7B model on a CPU is useful but
   will misread instructions. Tool-calling quality drops fast below 7B.
 - **Screen control is off by default and is the least reliable feature.**
@@ -325,10 +328,10 @@ pip install pynput              # macOS hotkeys
   "What did you do today?", Quit.
 - **Overlay**: small always-on-top window (corner and opacity configurable) with
   STOP and Pause.
-- **Hotkeys** (`hotkeys:` in `config.yaml`): `Ctrl+Alt+Esc` stop everything,
-  `Ctrl+Alt+Space` push-to-talk, `Ctrl+Alt+P` cycle personality,
-  `Ctrl+Alt+S` "look at my screen". On Wayland, or without `keyboard`/`pynput`,
-  the tray STOP button and the spoken stop phrase still work.
+- **The stop hotkey** (`hotkeys.killswitch` in `config.yaml`, default
+  `Ctrl+Alt+Esc`) — the one global hotkey this build registers. The tray STOP
+  button and the spoken stop phrase are the other two ways to stop it. On
+  Wayland, or without `keyboard`/`pynput`, all three still work.
 
 Disable any of it: `ui.enabled: false` (no tray, no window), `python main.py
 --no-ui`, or `hotkeys.backend: none`.
@@ -441,7 +444,7 @@ summarises the day.
 ## Talking to it
 
 Text mode: just type. Voice mode: say the wake word ("Garvis") first, then the
-request, or hold `Ctrl+Alt+Space` for push-to-talk.
+request.
 
 Examples:
 
@@ -478,8 +481,8 @@ Local commands (they never reach the model):
 
 ## Personality modes
 
-`brain.personality` in `config.yaml`, or `/personality <name>`, or
-`Ctrl+Alt+P`, or just say "switch to focus mode":
+`brain.personality` in `config.yaml`, or `/personality <name>`, or just say
+"switch to focus mode":
 
 | Mode | Tone |
 |---|---|
@@ -530,13 +533,13 @@ Everything lives in `config.yaml`, with comments. The sections:
 | `apps` | Launchable programs and close rules |
 | `voice_in` | Microphone, Whisper model/device, listen timing, wake word |
 | `voice_out` | Engine, voice, speed, volume, device, chunking, barge-in |
-| `hotkeys` | Kill switch, push-to-talk, personality cycle, screenshot hotkeys |
+| `hotkeys` | The stop hotkey and the backend it is registered with |
 | `memory` | Memory files, how much of the log is loaded into context |
 | `logging` | Level, file, activity log, redaction patterns |
 | `ui` | Tray, overlay, position, opacity, status line, STOP confirmation |
 | `state` | Task recording, history, auto-task, resume phrases |
 | `safety` | Kill phrases, timeouts, retries, verification, barge-in, wake-up briefing |
-| `self_test` | Which checks the self-test runs and its timeout |
+| `self_test` | Which checks the self-test runs (a disabled one is reported as skipped, never silently dropped) and its timeout |
 
 The optional cloud fallback lives inside `brain.cloud_fallback` and is
 **disabled by default**; turning it on also needs an API key in an environment
@@ -551,7 +554,7 @@ root.
 ## Tests and demos
 
 ```bash
-.venv/bin/pytest tests/ -q                 # the full suite: 467 passed, 1 skipped (~80 s)
+.venv/bin/pytest tests/ -q                 # the full suite: 499 passed, 1 skipped (~95 s)
 .venv/bin/pytest tests/test_stage3_permissions.py -v   # one stage
 ```
 
@@ -564,7 +567,16 @@ the *guarantees* rather than the features:
   real tools, and then searches both logs for them.
 - `tests/test_verification.py` puts tools that *lie* into the registry — they
   return success without doing anything — and checks that the lie is caught,
-  reported as a failure, and written to the log as one. There are also offline demos that need no model, no
+  reported as a failure, and written to the log as one.
+- `tests/test_cloud_fallback.py` proves the fallback is off by default with a
+  bomb client (nothing constructs one), that a missing key stays local, that a
+  fallback turn cannot act without `allow_tools`, and that the API key never
+  reaches a log.
+- `tests/test_config_coverage.py` enforces that `config.yaml` has no dead knobs
+  (every key is read), no hidden knobs (every key the code reads is in the file)
+  and no unexplained knobs (every key carries a comment, or its name says
+  everything). `tests/test_config_wiring.py` then proves the settings it covers
+  actually change behaviour. There are also offline demos that need no model, no
 microphone and no display:
 
 | Demo | Shows |

@@ -509,10 +509,19 @@ class Garvis:
         report = state.crash_report()
         if not report:
             return
+        # The audit record is written whatever the setting says: an unclean exit
+        # is something the log should know about even if the user asked not to
+        # be told about it at startup.
+        self.activity.event("system", "recovered after an unclean exit", extra={"report": report})
+        mention = bool(self.cfg.get("state.resume_on_start", True))
+        if not mention and not self.args.resume:
+            # state.resume_on_start: false - stay quiet unless the user explicitly
+            # asked for the task with --resume.
+            self.log.info("unfinished task not mentioned at startup (state.resume_on_start is false)")
+            return
         # A crash report is important enough to print even in --check mode:
         # the user should never have to guess whether last time ended badly.
         print(f"  -- unfinished business --\n  {report.replace(chr(10), chr(10) + '  ')}\n")
-        self.activity.event("system", "recovered after an unclean exit", extra={"report": report})
         if not self.args.resume:
             return
         task = state.resume_task("resumed automatically at startup (--resume)")
@@ -768,13 +777,18 @@ class Garvis:
 
         tts = self.services.get("tts")
         speaking = tts is not None and getattr(tts, "enabled", False)
+        # voice_out.sentence_chunking: true (default) speaks each sentence as it
+        # arrives, so the answer starts fast. false waits for the whole reply and
+        # speaks it in one go - slower to start, but no risk of a jittery engine
+        # clipping sentence boundaries.
+        chunk_stream = bool(self.cfg.get("voice_out.sentence_chunking", True))
 
         def on_event(event: BrainEvent) -> None:
             if event.kind == "delta":
                 print(event.text, end="", flush=True)
                 # Speak whole sentences as they appear: that is what makes the
                 # reply start quickly instead of waiting for the last token.
-                if chunker is not None:
+                if chunker is not None and chunk_stream:
                     for sentence in chunker.feed(event.text):
                         if speaking:
                             tts.say_chunk(sentence)
@@ -810,7 +824,11 @@ class Garvis:
             return True
 
         print()  # newline after streamed text
-        if chunker is not None:
+        if not chunk_stream:
+            # sentence_chunking is off: nothing was fed, so speak the reply whole.
+            if speaking and not result.interrupted and result.reply.strip():
+                tts.say_chunk(result.reply.strip())
+        elif chunker is not None:
             tail = chunker.flush()
             if tail and speaking and not result.interrupted:
                 tts.say_chunk(tail)

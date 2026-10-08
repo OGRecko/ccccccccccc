@@ -540,6 +540,12 @@ class Brain:
         self.cloud_used_last_turn = False
         if cfg.cloud_fallback_enabled:
             self._cloud = self._build_cloud_client(cfg)
+            if not bool(cfg.get("brain.cloud_fallback.use_only_if_local_down", True)):
+                log.warning(
+                    "brain.cloud_fallback.use_only_if_local_down is false, but cloud-first "
+                    "answers are not implemented in this build; the fallback still only runs "
+                    "when the local model fails."
+                )
 
         self.prompt_path: Path = cfg.path("brain.system_prompt", "prompts/system_prompt.md")
         self._prompt_template = system_prompt if system_prompt is not None else self._load_prompt()
@@ -907,8 +913,12 @@ class Brain:
         """Use the cloud model, but only if the user explicitly enabled it."""
         if self._cloud is None:
             return None
-        if bool(self.cfg.get("brain.cloud_fallback.use_only_if_local_down", True)) is False:
-            return None  # config says: never override a local answer
+        # NOTE: this is only reached after the local model failed, so "only if
+        # local is down" holds whatever the setting says. It used to return None
+        # when use_only_if_local_down was false - switching the fallback off
+        # entirely, the opposite of what that name reads as. Cloud-first answers
+        # are not implemented; Brain.__init__ warns about it and so does
+        # `--check`, instead of silently doing nothing.
         log.warning("Local model failed (%s); trying cloud fallback.", local_error)
         emit(BrainEvent("status", "Local model unavailable; using cloud fallback."))
         result.provider = "cloud"

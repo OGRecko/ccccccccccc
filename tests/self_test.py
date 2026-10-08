@@ -522,9 +522,10 @@ def check_ollama(ctx: Ctx) -> Result:
                      "run `ollama serve` (and `ollama pull "
                      f"{ctx.cfg.model}`), then run this self-test again")
     version = client.version() or "?"
-    models = client.list_models()
-    missing = [m for m in (ctx.cfg.model, ctx.cfg.vision_model) if not client.has_model(m)]
-    if not client.has_model(ctx.cfg.model):
+    compare_models = bool(ctx.cfg.get("self_test.check_models", True))
+    models = client.list_models() if compare_models else []
+    missing = [m for m in (ctx.cfg.model, ctx.cfg.vision_model) if not client.has_model(m)] if compare_models else []
+    if compare_models and not client.has_model(ctx.cfg.model):
         return _fail("ollama", f"model '{ctx.cfg.model}' is not installed (have: {', '.join(models) or 'none'})",
                      f"ollama pull {ctx.cfg.model}")
 
@@ -544,6 +545,8 @@ def check_ollama(ctx: Ctx) -> Result:
                      "check core/brain.py OllamaClient.chat")
 
     detail = f"ollama {version}, {ctx.cfg.model} answered in {took:.1f}s"
+    if not compare_models:
+        detail += " (self_test.check_models is false: the model list was not compared)"
     if missing:
         return _warn("ollama", detail + f"; not installed: {', '.join(missing)}",
                      " ".join(f"ollama pull {m}" for m in missing), models=models)
@@ -570,6 +573,9 @@ def check_voice_out(ctx: Ctx) -> Result:
         return _ok("voice out", f"engine ready: {detail} (not spoken in --quick mode)")
     if not ctx.speak:
         return _ok("voice out", f"engine ready: {detail} (pass --speak to hear it)")
+    if not bool(ctx.cfg.get("self_test.check_speaker", True)):
+        return _ok("voice out", f"engine ready: {detail} "
+                               f"(self_test.check_speaker is false: nothing was spoken)")
     tts.say("Self test: my voice works.", wait=True)
     if tts.last_error:
         return _fail("voice out", f"speaking failed: {tts.last_error}", "check voice_out.device")
@@ -851,6 +857,17 @@ def check_wake_up(ctx: Ctx) -> Result:
 # ---------------------------------------------------------------------------
 # running the checks
 # ---------------------------------------------------------------------------
+#: A check named here is skipped - and reported as skipped, never silently
+#: dropped - when the matching switch in config.yaml is false.
+CHECK_SWITCHES: dict[str, str] = {
+    "ollama": "self_test.check_ollama",
+    "voice out": "self_test.check_tts_voice",
+    "voice in": "self_test.check_mic",
+    "browser": "self_test.check_playwright",
+    "ui": "self_test.check_tray",
+    "sandbox": "self_test.check_folders",
+}
+
 CHECKS: tuple[tuple[str, Callable[[Ctx], Result], bool], ...] = (
     # (name, function, run in --quick mode too)
     ("environment", check_environment, True),
@@ -939,10 +956,16 @@ def run_self_test(cfg: Any = None, argv: list[str] | None = None, stream: Any = 
 
     results: list[Result] = []
     for name, fn, in_quick in CHECKS:
+        # A check that does not run is still *reported*, with the reason. Silence
+        # would leave the user unable to tell "tested and fine" from "never ran".
+        skip_reason = ""
         if args.quick and not in_quick:
-            results.append(_skip(name, "skipped in --quick mode"))
-            continue
-        result = _run_one(name, fn, ctx, timeout_s)
+            skip_reason = "skipped in --quick mode"
+        else:
+            switch = CHECK_SWITCHES.get(name)
+            if switch and not bool(ctx.cfg.get(switch, True)):
+                skip_reason = f"disabled in config.yaml ({switch}: false)"
+        result = _skip(name, skip_reason) if skip_reason else _run_one(name, fn, ctx, timeout_s)
         results.append(result)
         if not args.json:
             note = f"  {result.detail}"

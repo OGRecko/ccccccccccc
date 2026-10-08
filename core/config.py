@@ -240,6 +240,12 @@ class Config:
                     f"Cloud fallback is enabled but environment variable {key_env} is not set; "
                     f"GARVIS will stay local."
                 )
+            if not bool(self.get("brain.cloud_fallback.use_only_if_local_down", True)):
+                warnings.append(
+                    "brain.cloud_fallback.use_only_if_local_down is false: cloud-first answers are "
+                    "not implemented in this build, so the fallback will still only run when the "
+                    "local model fails. Set it back to true to silence this warning."
+                )
 
         prompt_rel = str(self.get("brain.system_prompt", ""))
         if prompt_rel and not self.resolve_path(prompt_rel).exists():

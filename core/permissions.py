@@ -937,6 +937,39 @@ class PermissionGate:
                 return True
         return False
 
+    # -- the breaker -------------------------------------------------------
+    def breaker_tripped(self) -> bool:
+        """True when repeated failures have stopped tool use."""
+        return self._consecutive_errors >= self.max_consecutive_errors
+
+    def reset_breaker(self, reason: str = "the user asked to carry on") -> bool:
+        """Clear the consecutive-failure breaker. Returns True if it was set.
+
+        Only a *user* action calls this (main.py, at the start of a message the
+        user typed or said). The model cannot: no tool reaches this method, and
+        clearing it automatically on a model-side retry would defeat the breaker
+        - which exists to stop a model that keeps failing from hammering away.
+
+        This is also the only way out. The counter used to zero itself on a
+        successful call, but a tripped breaker refuses every call before it can
+        run, so nothing could ever succeed: three transient failures bricked the
+        gate for the rest of the session while telling the user it was "waiting"
+        for something they had no way to do.
+        """
+        was_tripped = self._consecutive_errors > 0
+        self._consecutive_errors = 0
+        if was_tripped:
+            self.log_warning("failure breaker cleared (%s)", reason)
+            self._record(tool="(breaker)", args={}, tier=GREEN, decision="reset",
+                         note=f"cleared after {self.max_consecutive_errors} consecutive failures: {reason}")
+            if self.activity is not None:
+                try:
+                    self.activity.event("system", f"failure breaker cleared: {reason}",
+                                        extra={"decision": "reset"})
+                except Exception:
+                    pass
+        return was_tripped
+
     # -- execution ---------------------------------------------------------
     def execute(self, tool_name: str, args: dict[str, Any] | None = None) -> GateOutcome:
         """The single entry point for running a tool."""
@@ -948,14 +981,16 @@ class PermissionGate:
                 outcome = GateOutcome(
                     ok=False, tool=tool_name, tier=RED, decision=ABORTED,
                     content=f"Too many consecutive failures ({self._consecutive_errors}). "
-                            f"Stopping and waiting for the user.",
+                            f"Stopping here; nothing else will run this turn. Tell the user what "
+                            f"failed and that anything they say next clears this.",
                     display="aborted after repeated failures",
                 )
                 outcome.duration_ms = (time.perf_counter() - started) * 1000
                 self._record(tool=tool_name, args=self._log_args(tool_name, args), tier=RED,
                              decision=ABORTED, note="consecutive failure limit reached")
                 self.stats[ABORTED] += 1
-                self._notify("I have failed several times in a row, so I stopped. Please check.")
+                self._notify("I have failed several times in a row, so I stopped. "
+                             "Anything you say next lets me try again.")
                 return outcome
 
         tool = self.registry.get(tool_name)

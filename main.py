@@ -752,6 +752,13 @@ class Garvis:
         text = line.strip()
         if not text:
             return True
+        # A message from the user is the "asks" half of "stops and asks": if
+        # repeated failures stopped tool use, this is the human saying "carry on".
+        # The model cannot clear the breaker itself (see reset_breaker).
+        gate = self.services.get("gate")
+        if gate is not None and getattr(gate, "breaker_tripped", None) and gate.breaker_tripped():
+            if gate.reset_breaker("you sent a new message"):
+                print("  [tool use was paused after repeated failures; back on.]", flush=True)
         if chunker is None:
             # Always have a chunker: it is what turns the token stream into
             # speakable sentences. Callers that keep their own reuse it.

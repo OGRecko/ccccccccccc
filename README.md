@@ -436,7 +436,12 @@ Rules the code enforces, not the prompt:
   proof, and pretending otherwise would be worse than saying so.
 - **Timeouts and retries.** Every tool call has a timeout (`safety.tool_timeout_s`)
   and is retried once (`safety.tool_retries`) before GARVIS reports the failure.
-  Three consecutive failures (`max_consecutive_errors`) and it stops and asks.
+  Three consecutive failures (`max_consecutive_errors`) and it **stops and asks**:
+  tool use is refused for the rest of that turn — including reads, so nothing
+  runs on top of a broken state — and GARVIS says so instead of retrying forever.
+  **Your next message lifts it** (that is the "asks" half; a limit nothing could
+  lift used to brick the session). The model cannot lift it: no tool can reach
+  `reset_breaker`, only the user path in `main.py`.
 - **The kill switch.** `Ctrl+Alt+Esc`, the tray STOP button and the spoken
   stop phrase all call the same switch: it interrupts the model mid-answer,
   stops and mutes speech, halts every open browser profile, stops screen
@@ -570,7 +575,7 @@ root.
 ## Tests and demos
 
 ```bash
-.venv/bin/pytest tests/ -q                 # the full suite: 518 passed, 1 skipped (~95 s)
+.venv/bin/pytest tests/ -q                 # the full suite: 532 passed, 1 skipped (~105 s)
 .venv/bin/pytest tests/test_stage3_permissions.py -v   # one stage
 ```
 
@@ -588,6 +593,10 @@ the *guarantees* rather than the features:
   bomb client (nothing constructs one), that a missing key stays local, that a
   fallback turn cannot act without `allow_tools`, and that the API key never
   reaches a log.
+- `tests/test_breaker_recovery.py` trips the consecutive-failure breaker and
+  checks both halves of the promise: it holds for the whole turn (a failing tool
+  is not called again), and a user's message — and only a user's message — brings
+  tool use back, with the reset shown and audited.
 - `tests/test_injection_fence.py` plays the attacker: payloads that try to close
   the data fence early, forge an opening tag or hide instructions behind
   zero-width characters, through every path third-party text takes (files,

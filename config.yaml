@@ -407,7 +407,10 @@ safety:
   tool_retries: 1                # one retry, then report the failure honestly
                                  # (confirmation timeouts live where they belong:
                                  #  permissions.yellow_confirm.timeout_s / red_confirm.timeout_s)
-  max_consecutive_errors: 3      # after this many, GARVIS stops and asks
+  max_consecutive_errors: 3      # after this many failures in a row, tool use stops for
+                                 #   the rest of the turn (fail closed) and GARVIS says so.
+                                 #   Your next message clears it - a failure limit that
+                                 #   nothing could lift used to brick the session.
   wake_word_required: false      # true = ignore speech unless woken this turn
   allow_cloud_when_offline: false   # true = a screenshot may go to the cloud model when the local
                                     #   vision model is down (screen.allow_cloud_vision must agree too)

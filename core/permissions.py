@@ -69,6 +69,7 @@ BLOCKED = "blocked"        # never allowed, no confirmation possible
 ERROR = "error"            # tool raised
 TIMEOUT = "timeout"        # tool exceeded its timeout
 ABORTED = "aborted"        # too many consecutive failures; stopped
+STOPPED = "stopped"        # the kill switch is engaged; nothing runs until resume
 
 
 def promote(tier: str, to: str) -> str:
@@ -551,7 +552,8 @@ class PermissionGate:
 
         self._consecutive_errors = 0
         self._lock = threading.RLock()
-        self.stats = {ALLOWED: 0, CONFIRMED: 0, DENIED: 0, BLOCKED: 0, ERROR: 0, TIMEOUT: 0, ABORTED: 0}
+        self.stats = {ALLOWED: 0, CONFIRMED: 0, DENIED: 0, BLOCKED: 0, ERROR: 0,
+                      TIMEOUT: 0, ABORTED: 0, STOPPED: 0}
 
     # -- construction helpers ---------------------------------------------
     @staticmethod
@@ -1033,6 +1035,27 @@ class PermissionGate:
         started = time.perf_counter()
 
         with self._lock:
+            switch = self.services.get("killswitch")
+            if switch is not None and getattr(switch, "frozen", False):
+                # "stop everything" has to mean *everything*, and this is the one
+                # door every tool call goes through. handle_line already refuses
+                # to send a frozen session's text to the model, so this is the
+                # second lock on the same door: a UI button, a worker thread or a
+                # future caller cannot quietly run a tool after a stop.
+                outcome = GateOutcome(
+                    ok=False, tool=tool_name, tier=RED, decision=STOPPED,
+                    content="Stopped: the kill switch is engaged, so nothing runs. Tell the "
+                            "user the stop is still on and that saying 'resume' ends it - do "
+                            "not retry, and do not look for another route.",
+                    display="stopped by the kill switch",
+                )
+                outcome.duration_ms = (time.perf_counter() - started) * 1000
+                self._record(tool=tool_name, args=self._log_args(tool_name, args), tier=RED,
+                             decision=STOPPED, note="the kill switch is engaged")
+                self.stats[STOPPED] = self.stats.get(STOPPED, 0) + 1
+                self._notify("I am stopped. Say 'resume' when you want me to carry on.")
+                return outcome
+
             if self._consecutive_errors >= self.max_consecutive_errors:
                 outcome = GateOutcome(
                     ok=False, tool=tool_name, tier=RED, decision=ABORTED,

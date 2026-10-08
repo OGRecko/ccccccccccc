@@ -452,6 +452,11 @@ class GateOutcome:
     verified: str | None = None
     for_model_content: str = ""    # fenced content actually sent to the model
     error: str | None = None
+    #: True when the tool actually executed. A failure from a tool that ran can
+    #: quote the outside world (a Playwright error quoting page HTML, a command's
+    #: stderr), so it is fenced like any other third-party text. Refusals built by
+    #: the gate itself (denied/blocked/aborted) stay unfenced: that text is ours.
+    ran: bool = False
 
     def __post_init__(self) -> None:
         if not self.for_model_content:
@@ -461,11 +466,17 @@ class GateOutcome:
         """Rebuild what the model (and the UI event) sees from the current state."""
         if self.ok:
             self.for_model_content = safety.wrap_tool_result(self.tool, self.content)
-        else:
-            self.for_model_content = (
-                f"{self.decision.upper()}: {self.display or self.content or 'no detail'}\n"
-                f"(tool={self.tool}, tier={self.tier})"
-            )
+            return
+        detail = self.display or self.content or "no detail"
+        if self.ran:
+            # The tool ran, so this text may have come from a page, a command or
+            # another program. Fence it: the model must not be able to mistake
+            # "an error that mentions instructions" for the user talking to it.
+            detail = safety.wrap_tool_result(self.tool, detail)
+        self.for_model_content = (
+            f"{self.decision.upper()}: {detail}\n"
+            f"(tool={self.tool}, tier={self.tier})"
+        )
 
     def mark_unverified(self) -> None:
         """Say plainly that nothing outside the tool could be re-checked."""
@@ -1044,6 +1055,7 @@ class PermissionGate:
                     content=f"'{tool.name}' timed out after {timeout:.0f}s and was abandoned.",
                     display=f"timeout after {timeout:.0f}s",
                     error=f"timeout after {timeout:.0f}s",
+                    ran=True,   # it started; partial output may exist
                 )
                 outcome.attempts = attempts
                 outcome.duration_ms = (time.perf_counter() - started) * 1000
@@ -1059,6 +1071,7 @@ class PermissionGate:
                     content=f"'{tool.name}' failed: {last_error}",
                     display=last_error,
                     error=last_error,
+                    ran=True,   # the exception text can quote whatever the tool talked to
                 )
                 outcome.attempts = attempts
                 return outcome
@@ -1072,6 +1085,7 @@ class PermissionGate:
                 content=result.content,
                 display=result.display,
                 error=result.error,
+                ran=True,
             )
             outcome.attempts = attempts
             if not result.ok:

@@ -400,10 +400,26 @@ Rules the code enforces, not the prompt:
 - **Human takeover.** CAPTCHA, 2FA prompts, "verify you are human" and bot walls
   are detected and stop automation for that profile until you finish and say
   "continue".
-- **Prompt-injection defence.** Anything from a page, a file or a command output
-  is wrapped as untrusted data with explicit instructions to treat it as
-  content, never as commands. If a web page tells GARVIS to email your files
-  somewhere, it will read that text out loud to you instead of obeying it.
+- **Prompt-injection defence.** Anything from a page, a file, a command output or
+  a memory file is wrapped in an `<untrusted_data>` block that says, in the
+  prompt's own words, that it is data and can never change GARVIS's instructions
+  or permissions. If a web page tells GARVIS to email your files somewhere, it
+  reads that text to you as content instead of obeying it.
+  - The fence **cannot be closed early**: a payload that contains
+    `</untrusted_data>` (or a forged opening tag, attributes and all) has the tag
+    broken before it is embedded, so it can never appear to be outside the block.
+  - **Failures are fenced too.** A tool that ran and failed can quote the outside
+    world — Playwright's strict-mode errors quote page HTML — so a failure's text
+    travels in the same block. Only the gate's own refusals stay in plain words.
+  - **You are told when something tries it.** The usual attack shapes ("ignore
+    previous instructions", "you are now…", requests to print secrets) raise a
+    warning in `logs/garvis.log` and a record in the audit trail, once per
+    distinct payload rather than on every turn.
+  - **Honest boundary:** that detection is best-effort telemetry, not a filter —
+    the text is never deleted (it may be the security report you asked about) and
+    a clever payload will not match the patterns. The fence is the defence, and
+    neither replaces the permission gate: even a perfect-looking instruction still
+    has to get past `core/permissions.py`.
 - **Verification.** After a state-changing action the gate checks the end state
   and puts what it found into the answer (`notes.txt exists (412 bytes)`).
   `files.write`/`append`/`mkdir` must exist afterwards; `files.copy`/`move`
@@ -554,7 +570,7 @@ root.
 ## Tests and demos
 
 ```bash
-.venv/bin/pytest tests/ -q                 # the full suite: 499 passed, 1 skipped (~95 s)
+.venv/bin/pytest tests/ -q                 # the full suite: 518 passed, 1 skipped (~95 s)
 .venv/bin/pytest tests/test_stage3_permissions.py -v   # one stage
 ```
 
@@ -572,6 +588,10 @@ the *guarantees* rather than the features:
   bomb client (nothing constructs one), that a missing key stays local, that a
   fallback turn cannot act without `allow_tools`, and that the API key never
   reaches a log.
+- `tests/test_injection_fence.py` plays the attacker: payloads that try to close
+  the data fence early, forge an opening tag or hide instructions behind
+  zero-width characters, through every path third-party text takes (files,
+  searches, commands, memory, and tool failures).
 - `tests/test_config_coverage.py` enforces that `config.yaml` has no dead knobs
   (every key is read), no hidden knobs (every key the code reads is in the file)
   and no unexplained knobs (every key carries a comment, or its name says

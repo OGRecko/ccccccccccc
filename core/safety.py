@@ -42,6 +42,9 @@ _INJECTION_PATTERNS: tuple[tuple[str, str], ...] = (
 
 _INJECTION_RE = [(re.compile(p), why) for p, why in _INJECTION_PATTERNS]
 
+#: Any opening or closing fence tag, with or without attributes or case changes.
+_FENCE_TAG_RE = re.compile(r"<\s*(/?)\s*untrusted_data\b", re.IGNORECASE)
+
 # Zero-width and bidi-control characters are used to hide instructions from a
 # human reader while an LLM still sees them. Strip them from untrusted text.
 _INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")
@@ -69,12 +72,58 @@ def neutralize(text: str) -> tuple[str, bool]:
     Returns ``(text, altered)``. We break the literal tag sequence so content
     can never terminate the data block early, and defang common role markers.
     """
-    altered = False
-    if UNTRUSTED_CLOSE in text or "<untrusted_data" in text:
-        text = text.replace(UNTRUSTED_CLOSE, "<\\/untrusted_data>")
-        text = text.replace(UNTRUSTED_OPEN, "<\\unt_trusted_data>")
-        altered = True
-    return text, altered
+    text, altered = _FENCE_TAG_RE.subn(_break_fence_tag, text)
+    return text, bool(altered)
+
+
+def _break_fence_tag(match: "re.Match[str]") -> str:
+    """Defang one fence tag by renaming it, so it cannot open or close the block.
+
+    Attribute forms count: ``<untrusted_data source='system'>`` is just as good a
+    forgery as the bare tag, and matching only the bare form left it intact.
+    """
+    slash = match.group(1)
+    return f"<\\{slash}unt_trusted_data"
+
+
+#: Attacks already reported, so a poisoned memory file is reported once rather
+#: than on every turn it is loaded. Keyed by (source, reason, snippet).
+_REPORTED: set[tuple[str, str, str]] = set()
+
+
+def report_injection(source: str, reasons: list[str], text: str) -> bool:
+    """Log an injection attempt to the app log and the audit trail.
+
+    Telemetry, not a filter: the text is still fenced and passed through. Returns
+    True the first time a given attempt is seen, False for repeats. Never raises -
+    a warning about untrusted text must not be able to break the turn.
+    """
+    snippet = " ".join(text[:120].split())
+    fresh = False
+    for reason in reasons:
+        key = (source, reason, snippet)
+        if key in _REPORTED:
+            continue
+        _REPORTED.add(key)
+        fresh = True
+        try:
+            from .logger import activity, get_logger
+
+            message = (
+                f"prompt-injection attempt in {source}: {reason}. "
+                f"The text was fenced as data and passed through, not obeyed."
+            )
+            get_logger(__name__).warning("%s | first 120 chars: %s", message, snippet)
+            try:
+                activity().event(
+                    "system", message, ok=False,
+                    extra={"source": source, "reasons": reasons, "snippet": snippet},
+                )
+            except Exception:
+                pass  # no audit trail configured (library use, tests)
+        except Exception:
+            pass  # a report must never break the fence it is reporting on
+    return fresh
 
 
 def wrap_untrusted(
@@ -106,6 +155,12 @@ def wrap_untrusted(
     """
     raw = "" if text is None else str(text)
     raw = strip_invisible(raw)
+
+    # Requirement 5's second half: tell the user when something tried to give
+    # GARVIS instructions. Deduplicated, and it never changes the text itself.
+    reasons = scan_for_injection(raw)
+    if reasons:
+        report_injection(source, reasons, raw)
 
     truncated = False
     if max_chars and len(raw) > max_chars:

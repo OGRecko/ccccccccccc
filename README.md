@@ -401,8 +401,20 @@ Rules the code enforces, not the prompt:
   is wrapped as untrusted data with explicit instructions to treat it as
   content, never as commands. If a web page tells GARVIS to email your files
   somewhere, it will read that text out loud to you instead of obeying it.
-- **Verification.** State-changing actions are followed by a screenshot or a
-  result check, and failures are reported honestly, with the raw error.
+- **Verification.** After a state-changing action the gate checks the end state
+  and puts what it found into the answer (`notes.txt exists (412 bytes)`).
+  `files.write`/`append`/`mkdir` must exist afterwards; `files.copy`/`move`
+  must land where they said (and the source must be gone); `files.delete` must
+  leave nothing behind. Destructive tools are also checked against what was
+  there *before* the call, so "deleted" a file that never existed is caught
+  too. A failed check is not a footnote: it turns the call into `FLAGGED` and
+  the failure is what you and the model see. Browser actions are followed by a
+  screenshot of the page; screen controls take their own in stage 7.
+  What it cannot do: see inside a tool that reports nothing re-checkable. Those
+  are *not* quietly counted as verified — the result says
+  `[not independently verified: ...]` instead (turn it off with
+  `permissions.note_unverified: false`). "I sent that email" has no filesystem
+  proof, and pretending otherwise would be worse than saying so.
 - **Timeouts and retries.** Every tool call has a timeout (`safety.tool_timeout_s`)
   and is retried once (`safety.tool_retries`) before GARVIS reports the failure.
   Three consecutive failures (`max_consecutive_errors`) and it stops and asks.
@@ -420,7 +432,8 @@ Rules the code enforces, not the prompt:
 
 Logs: everything is appended to `logs/activity_log.txt` (human-readable) and
 `logs/activity_log-YYYY-MM-DD.jsonl` (machine-readable), with credentials
-redacted before they are written. `python main.py --today` (or the tray item)
+redacted before they are written, and tool results cut to one redacted line
+(`logging.result_max_chars`). `python main.py --today` (or the tray item)
 summarises the day.
 
 ---
@@ -538,13 +551,20 @@ root.
 ## Tests and demos
 
 ```bash
-.venv/bin/pytest tests/ -q                 # the full suite: 424 passed, 1 skipped (~75 s)
+.venv/bin/pytest tests/ -q                 # the full suite: 467 passed, 1 skipped (~80 s)
 .venv/bin/pytest tests/test_stage3_permissions.py -v   # one stage
 ```
 
-Every build stage has its own tests (stage 1 → 9), plus
-`tests/test_killswitch_work.py`, which runs real processes, presses stop, and
-checks they really died. There are also offline demos that need no model, no
+Every build stage has its own tests (stage 1 → 9), plus three suites that test
+the *guarantees* rather than the features:
+
+- `tests/test_killswitch_work.py` runs real processes, presses stop, and checks
+  they really died (including a grandchild that ignores `SIGTERM`).
+- `tests/test_log_privacy.py` writes canaries into files, reads them with the
+  real tools, and then searches both logs for them.
+- `tests/test_verification.py` puts tools that *lie* into the registry — they
+  return success without doing anything — and checks that the lie is caught,
+  reported as a failure, and written to the log as one. There are also offline demos that need no model, no
 microphone and no display:
 
 | Demo | Shows |
@@ -640,9 +660,18 @@ garvis/
   are covered by tests, including a live check in the self-test.
 - **Redaction** runs before anything is written to a log
   (`logging.redact_patterns`): password-like keys, card numbers, tokens, keys.
+- **A tool result cannot smuggle a secret into the log.** Tool output is
+  redacted *and* cut to one line before it is written
+  (`logging.result_max_chars`, default 400): the model and you still get the
+  whole thing, the log does not. `tests/test_log_privacy.py` drives real files
+  containing canaries through `files.read`, `files.search` and `shell.run`, then
+  reads the log back looking for them.
 - **The log is an audit trail.** `logs/activity_log.txt` answers "what did you
   do today?" honestly, including the things that failed and the things that
   were refused.
+- **State-changing actions are checked afterwards** (see below), and a check
+  that comes back negative is reported as a *failure* — a tool cannot claim it
+  wrote or deleted something that is not there.
 - **Give it the smallest allowlists you can live with**, and prefer running it
   under your own user account with the browser profiles you are willing to have
   logged in.

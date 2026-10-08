@@ -52,7 +52,16 @@ def _make_registry(cfg: Config, effects: dict[str, Any]) -> ToolRegistry:
         return ToolResult.success(f"wrote {len(text)} bytes to {p}")
 
     def delete_path(path: str = "") -> ToolResult:
-        effects["delete"] = path  # deliberately NOT performed: tests assert it never runs
+        # It really deletes, because the gate now checks the end state after a
+        # state-changing call: a double that only *claims* to delete is a tool
+        # that lies, and the gate would (rightly) report it as failed. The tests
+        # that assert "delete never ran" do so through `effects`, which is only
+        # touched here - so they still mean what they say.
+        target = Path(path)
+        if not target.is_absolute():
+            target = cfg.resolve_path(cfg.get("files.sandbox_dir")) / target
+        target.unlink(missing_ok=True)
+        effects["delete"] = path
         return ToolResult.success(f"deleted {path}")
 
     def run_command(command: str = "") -> ToolResult:
@@ -94,10 +103,12 @@ def _make_registry(cfg: Config, effects: dict[str, Any]) -> ToolRegistry:
                            func=read_file, tier=GREEN, readonly=True, path_args=("path",)))
     registry.register(Tool(name="files.write", description="write a file",
                            parameters={"type": "object", "properties": {}},
-                           func=write_file, tier=YELLOW, path_args=("path",)))
+                           func=write_file, tier=YELLOW, path_args=("path",),
+                           path_base="sandbox"))
     registry.register(Tool(name="files.delete", description="delete a path",
                            parameters={"type": "object", "properties": {}},
-                           func=delete_path, tier=RED, path_args=("path",)))
+                           func=delete_path, tier=RED, path_args=("path",),
+                           path_base="sandbox"))
     registry.register(Tool(name="shell.run", description="run a command",
                            parameters={"type": "object", "properties": {}},
                            func=run_command, tier=YELLOW, command_args=("command",)))
@@ -284,9 +295,13 @@ def test_red_two_step_challenge_accepts_the_exact_action(cfg, registry, activity
     confirmer = ConsoleConfirmer(interactive=False)
     gate = PermissionGate(cfg=cfg, activity=activity, services={"registry": registry},
                           confirmer=confirmer, registry=registry)
+    important = cfg.resolve_path(cfg.get("files.sandbox_dir")) / "important.txt"
+    important.write_text("do not lose this")
     outcome = gate.execute("files.delete", {"path": "important.txt"})
     assert outcome.ok and outcome.decision == CONFIRMED
     assert effects["delete"] == "important.txt"
+    assert not important.exists(), "the confirmed delete did not actually delete"
+    assert outcome.verified and "is gone" in outcome.verified
 
 
 def test_red_two_step_challenge_rejects_wrong_wording(cfg, registry, activity, effects, monkeypatch):
@@ -550,3 +565,24 @@ def test_services_attached_after_registration_are_visible(cfg, activity, memory)
     services["memory"] = memory  # attached later, exactly like main.py does
     later = gate.execute("memory.read", {"what": "profile"})
     assert later.ok, "the tool should see the service attached after registration"
+
+
+def test_allowlist_is_checked_against_the_folder_the_tool_writes_to(cfg, registry, activity, tmp_path):
+    """A relative path must be judged where the tool will put it.
+
+    The file tools resolve "note.txt" inside the sandbox; the shell resolves it
+    inside shell.default_cwd. If the gate used the shell's rule for a file tool,
+    it would allow or refuse a write based on a folder the write never touches -
+    which is how a write outside the allowlist can look approved.
+    """
+    other = tmp_path / "shell-cwd"
+    other.mkdir()
+    cfg.set("shell.default_cwd", str(other))          # NOT in the allowlists
+    sandbox = cfg.resolve_path(cfg.get("files.sandbox_dir"))
+
+    gate = make_gate(cfg, registry, activity, ScriptedConfirmer(approve_all=True))
+    outcome = gate.execute("files.write", {"path": "note.txt", "text": "hello"})
+
+    assert outcome.ok, outcome.content
+    assert (sandbox / "note.txt").read_text() == "hello"
+    assert not (other / "note.txt").exists(), "the gate checked a folder the write never touched"

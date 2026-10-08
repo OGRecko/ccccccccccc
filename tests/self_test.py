@@ -94,6 +94,12 @@ class Ctx:
             cfg.set("logging.activity_jsonl", str(self.workdir / "activity_log.jsonl"))
             cfg.set("logging.file", str(self.workdir / "garvis.log"))
             cfg.set("files.sandbox_dir", str(self.workdir / "sandbox"))
+            # The allowlists have to move with the sandbox. If they kept pointing
+            # at the real folders, the gate would approve a relative path that
+            # resolves elsewhere and the tools would write outside what the gate
+            # checked - so the self-test works entirely inside its workdir.
+            cfg.set("files.allowed_read", [str(self.workdir / "sandbox"), str(self.workdir / "memory")])
+            cfg.set("files.allowed_write", [str(self.workdir / "sandbox"), str(self.workdir / "memory")])
             cfg.set("screen.shots_dir", str(self.workdir / "screen_shots"))
             cfg.set("screen.frames_dir", str(self.workdir / "screen_frames"))
             cfg.set("browser.screenshots_dir", str(self.workdir / "browser_shots"))

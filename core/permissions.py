@@ -52,6 +52,16 @@ RED = "red"
 _TIER_RANK = {GREEN: 0, YELLOW: 1, RED: 2}
 
 # Decisions recorded in the log.
+VERIFY_FAILED_PREFIX = "VERIFY FAILED:"
+#: Tools whose claim cannot be judged without knowing the state beforehand.
+_NEEDS_BEFORE = ("files.delete", "files.move", "files.copy")
+
+#: Added to a state-changing tool's output when no check was possible at all.
+UNVERIFIED_NOTE = (
+    "[not independently verified: this tool reports no state that could be re-checked "
+    "afterwards, so 'it worked' here means the tool said so]"
+)
+FLAGGED = "flagged"        # ran, then the result was not there -> reported as failed
 ALLOWED = "allowed"        # GREEN: ran without asking
 CONFIRMED = "confirmed"    # user approved a YELLOW/RED action
 DENIED = "denied"          # user said no, or the confirmation timed out
@@ -445,13 +455,46 @@ class GateOutcome:
 
     def __post_init__(self) -> None:
         if not self.for_model_content:
-            if self.ok:
-                self.for_model_content = safety.wrap_tool_result(self.tool, self.content)
-            else:
-                self.for_model_content = (
-                    f"{self.decision.upper()}: {self.display or self.content or 'no detail'}\n"
-                    f"(tool={self.tool}, tier={self.tier})"
-                )
+            self.refresh_for_model()
+
+    def refresh_for_model(self) -> None:
+        """Rebuild what the model (and the UI event) sees from the current state."""
+        if self.ok:
+            self.for_model_content = safety.wrap_tool_result(self.tool, self.content)
+        else:
+            self.for_model_content = (
+                f"{self.decision.upper()}: {self.display or self.content or 'no detail'}\n"
+                f"(tool={self.tool}, tier={self.tier})"
+            )
+
+    def mark_unverified(self) -> None:
+        """Say plainly that nothing outside the tool could be re-checked."""
+        self.content = (
+            f"{self.content}\n{UNVERIFIED_NOTE}" if self.content else UNVERIFIED_NOTE
+        )
+        self.refresh_for_model()
+
+    def apply_verification(self, note: str) -> None:
+        """Fold a verification note into the outcome, honestly.
+
+        Evidence ("notes.txt exists, 412 bytes") is added to the content so the
+        model knows its work was checked. A failure ("VERIFY FAILED: ...") turns
+        the outcome into a failure: the action was reported as done, the world
+        says otherwise, and the user must hear that - not a success message.
+        """
+        self.verified = note
+        if note.startswith(VERIFY_FAILED_PREFIX):
+            self.ok = False
+            self.error = note
+            self.display = f"{note} (the tool said it worked)"
+            self.content = (
+                f"{note}\nThe tool reported success, but the result could not be found, "
+                f"so this is being reported as a failure."
+            )
+            self.decision = FLAGGED
+        else:
+            self.content = f"{self.content}\n[checked] {note}" if self.content else f"[checked] {note}"
+        self.refresh_for_model()
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +534,7 @@ class PermissionGate:
         self.default_timeout = float(cfg.get("safety.tool_timeout_s", 60))
         self.max_retries = max(0, int(cfg.get("safety.tool_retries", 1)))
         self.max_consecutive_errors = int(cfg.get("safety.max_consecutive_errors", 3))
+        self.note_unverified = bool(cfg.get("permissions.note_unverified", True))
         self.confirmer = confirmer if confirmer is not None else self.build_confirmer(cfg)
 
         self._consecutive_errors = 0
@@ -680,7 +724,7 @@ class PermissionGate:
         tier = tool.tier
         reasons: list[str] = []
         for raw in paths:
-            resolved = self.resolve_user_path(raw)
+            resolved = self.resolve_for(tool, raw)
             if self.matches_denied_glob(resolved):
                 return Classification(
                     RED,
@@ -817,16 +861,38 @@ class PermissionGate:
         return Classification(tier, reasons)
 
     # -- path helpers ------------------------------------------------------
-    def resolve_user_path(self, raw: str) -> Path:
+    def base_for(self, tool: Any = None) -> Path | None:
+        """Where a tool resolves relative paths; None = the shell's own rule.
+
+        A tool states this with ``Tool.path_base``. It matters: `files.write`
+        puts "notes.txt" in the sandbox, while `shell.run` runs it in
+        shell.default_cwd. Checking (and verifying) the wrong one means the
+        gate inspects a different file than the tool touched.
+        """
+        if getattr(tool, "path_base", "") == "sandbox":
+            return self._sandbox_dir()
+        return None
+
+    def _sandbox_dir(self) -> Path:
+        return self.cfg.resolve_path(self.cfg.get("files.sandbox_dir", "sandbox"))
+
+    def resolve_for(self, tool: Any, raw: str) -> Path:
+        return self.resolve_user_path(raw, base=self.base_for(tool))
+
+    def resolve_user_path(self, raw: str, base: Path | str | None = None) -> Path:
         text = str(raw).strip().strip('"').strip("'")
         path = Path(os.path.expandvars(os.path.expanduser(text)))
         if not path.is_absolute():
-            base = self.sandbox
-            # Relative paths resolve inside the sandbox by default.
-            shell_cwd = self.cfg.get("shell.default_cwd")
-            if shell_cwd:
-                base = self.cfg.resolve_path(shell_cwd)
-            path = base / path
+            if base is not None:
+                path = Path(base) / path
+            else:
+                # Relative paths resolve inside the sandbox by default; when the
+                # shell has its own working folder, that is the shell's rule.
+                folder = self._sandbox_dir()
+                shell_cwd = self.cfg.get("shell.default_cwd")
+                if shell_cwd:
+                    folder = self.cfg.resolve_path(shell_cwd)
+                path = folder / path
         try:
             resolved = path.resolve()
         except OSError:
@@ -965,6 +1031,7 @@ class PermissionGate:
 
     def _run_tool(self, tool: Any, args: dict[str, Any], tier: str, started: float) -> GateOutcome:
         timeout = float(tool.timeout_s or self.default_timeout)
+        before = self._snapshot_state(tool, args)
         attempts = 0
         last_error: str | None = None
         while attempts <= self.max_retries:
@@ -1010,7 +1077,13 @@ class PermissionGate:
             if not result.ok:
                 self.log_warning("%s returned a failure: %s", tool.name, result.error or result.content[:200])
             if result.ok and not tool.readonly:
-                outcome.verified = self._verify(tool, args, result)
+                note = self._verify(tool, args, result, before)
+                if note:
+                    outcome.apply_verification(note)
+                    if not outcome.ok:
+                        self.log_warning("verification failed for %s: %s", tool.name, note)
+                elif self.note_unverified:
+                    outcome.mark_unverified()
             return outcome
         # Unreachable, but keeps the type checker honest.
         return GateOutcome(ok=False, tool=tool.name, tier=tier, decision=ERROR,
@@ -1045,32 +1118,144 @@ class PermissionGate:
         return value
 
     # -- verification (requirement 6) --------------------------------------
-    def _verify(self, tool: Any, args: dict[str, Any], result: Any) -> str | None:
-        """Check that a state-changing action actually did what it claimed.
-
-        Cheap, deterministic checks first (re-stat a file we just wrote). The
-        screenshot path is added by stage 7 through ``services['verifier']``.
-        """
-        notes: list[str] = []
-        if tool.name.startswith("files.write") or tool.name.startswith("files.append"):
-            for arg_name in getattr(tool, "path_args", ()) or ():
-                raw = args.get(arg_name)
-                if not raw:
-                    continue
-                path = self.resolve_user_path(str(raw))
-                if path.exists():
-                    notes.append(f"{path.name} exists ({path.stat().st_size} bytes)")
-                else:
-                    return f"VERIFY FAILED: {path} does not exist after the write"
-        verifier = self.services.get("verifier")
-        if verifier is not None and not tool.readonly:
-            try:
-                extra = verifier(tool.name, args)
-                if extra:
-                    notes.append(str(extra))
-            except Exception as exc:  # verification problems must not crash the turn
-                notes.append(f"verification hook failed: {exc}")
+    #
+    # What "verified" means here, exactly: after a successful state-changing
+    # call, check the end state and say what was found. Whatever the check
+    # reports goes into the answer the model and the user see, and a check that
+    # comes back negative turns the call into a failure - a tool must not be
+    # able to claim it moved a file that is not there.
+    #
+    # What it does not mean: it is not a proof that the change was the right
+    # one, and it cannot see inside another program. Files are checked by
+    # re-stating them; browser actions get a screenshot through
+    # ``services['verifier']`` (``core.browser.after_action_note``, registered in
+    # main.py), and screen-control tools take their own screenshot in stage 7.
+    def _verify(self, tool: Any, args: dict[str, Any], result: Any = None,
+                before: dict[str, bool] | None = None) -> str | None:
+        """Check that a state-changing action actually did what it claimed."""
+        failure = self._verify_expected_state(tool, args, before or {})
+        if failure:
+            return failure
+        notes = self._verify_notes(tool, args)
+        if not notes:
+            # Nothing to re-read on disk: this is where a hook can look instead
+            # (browser actions, through services['verifier']).
+            verifier = self.services.get("verifier")
+            if verifier is not None:
+                try:
+                    extra = verifier(tool.name, args)
+                    if extra:
+                        notes.append(str(extra))
+                except Exception as exc:  # verification problems must not crash the turn
+                    notes.append(f"verification hook failed: {exc}")
         return "; ".join(notes) if notes else None
+
+    def _paths(self, tool: Any, args: dict[str, Any]) -> list[Path]:
+        """The paths a tool's own declaration says it touched."""
+        paths: list[Path] = []
+        for arg_name in getattr(tool, "path_args", ()) or ():
+            raw = args.get(arg_name)
+            if not raw:
+                continue
+            try:
+                paths.append(self.resolve_for(tool, str(raw)))
+            except Exception:
+                continue
+        return paths
+
+    def _snapshot_state(self, tool: Any, args: dict[str, Any]) -> dict[str, bool]:
+        """What the world looks like *before* the call.
+
+        Destructive verbs need this: "the file is gone" proves nothing if it was
+        never there, and a tool that says it deleted something nonexistent has
+        told you nothing about the world.
+        """
+        if tool.name not in _NEEDS_BEFORE:
+            return {}
+        return {str(path): path.exists() for path in self._paths(tool, args)}
+
+    def _verify_expected_state(self, tool: Any, args: dict[str, Any],
+                              before: dict[str, bool]) -> str | None:
+        """Compare the world with what the tool just claimed. None = as expected."""
+        name = tool.name
+        paths = self._paths(tool, args)
+
+        def missing(path: Path, verb: str) -> str:
+            return f"{VERIFY_FAILED_PREFIX} {path} is not there after the {verb}"
+
+        if name.startswith(("files.write", "files.append")) or name == "files.write":
+            for path in paths:
+                if not path.exists():
+                    return missing(path, "write")
+        elif name == "files.mkdir":
+            for path in paths:
+                if not path.is_dir():
+                    return missing(path, "mkdir")
+        elif name == "files.copy":
+            if len(paths) >= 2:
+                source, destination = paths[0], paths[-1]
+                if not before.get(str(source), False):
+                    return (f"{VERIFY_FAILED_PREFIX} {source} was not there before the copy, "
+                            f"so there was nothing to copy")
+                if destination.is_dir():
+                    destination = destination / source.name  # copies into folders, like the tool does
+                if not destination.exists():
+                    return missing(destination, "copy")
+        elif name == "files.move":
+            if len(paths) >= 2:
+                source, destination = paths[0], paths[-1]
+                if not before.get(str(source), False):
+                    return (f"{VERIFY_FAILED_PREFIX} {source} was not there before the move, "
+                            f"so there was nothing to move")
+                if not destination.exists():
+                    return missing(destination, "move")
+                if source.exists():
+                    same = False
+                    try:
+                        same = destination.samefile(source)  # case-only rename on a lenient filesystem
+                    except OSError:
+                        pass
+                    if not same:
+                        return (f"{VERIFY_FAILED_PREFIX} {source} is still there after the move "
+                                f"to {destination}")
+        elif name == "files.delete":
+            for path in paths:
+                if path.exists():
+                    return f"{VERIFY_FAILED_PREFIX} {path} is still there after the delete"
+                if not before.get(str(path), False):
+                    return (f"{VERIFY_FAILED_PREFIX} {path} was not there before the delete, "
+                            f"so nothing was deleted")
+        return None
+
+    def _verify_notes(self, tool: Any, args: dict[str, Any]) -> list[str]:
+        """Positive evidence, so the log and the model can see the check happened."""
+        name = tool.name
+        paths = self._paths(tool, args)
+        notes: list[str] = []
+        if name.startswith(("files.write", "files.append")):
+            for path in paths:
+                try:
+                    notes.append(f"{path.name} exists ({path.stat().st_size} bytes)")
+                except OSError:
+                    pass
+        elif name == "files.mkdir":
+            for path in paths:
+                if path.is_dir():
+                    notes.append(f"{path.name} exists")
+        elif name == "files.copy":
+            if len(paths) >= 2:
+                destination = paths[-1] / paths[0].name if paths[-1].is_dir() else paths[-1]
+                try:
+                    notes.append(f"{destination.name} exists ({destination.stat().st_size} bytes)")
+                except OSError:
+                    pass
+        elif name == "files.move":
+            if len(paths) >= 2:
+                notes.append(f"{paths[-1].name} exists; {paths[0].name} is gone")
+        elif name == "files.delete":
+            for path in paths:
+                notes.append(f"{path.name} is gone")
+        return notes
 
     # -- helpers -----------------------------------------------------------
     def _confirm(
@@ -1129,7 +1314,7 @@ class PermissionGate:
         require_phrase = str(cfg.get("require_phrase", "confirm"))
         require_repeat = bool(cfg.get("require_repeat", True))
         base_reasons = list(reasons) + [
-            f"RED actions are irreversible, cost money, or change security/admin settings"
+            "RED actions are irreversible, cost money, or change security/admin settings"
         ]
 
         method = "none"

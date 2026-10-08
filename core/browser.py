@@ -1296,3 +1296,34 @@ class BrowserManager:
             open_labels = ", ".join(sorted(self._state)) or "none"
             bits.append(f"known profiles: {open_labels}")
         return ", ".join(bits)
+
+
+# ---------------------------------------------------------------------------
+# Verification support (requirement 6)
+# ---------------------------------------------------------------------------
+def after_action_note(services: dict[str, Any], tool_name: str, args: dict[str, Any]) -> str | None:
+    """Evidence that a browser action landed: the page afterwards.
+
+    The permission gate calls this after a state-changing browser tool, because
+    a click cannot be re-read from disk the way a written file can. Returning
+    None is a real answer ("nothing to add"): the gate then tells the model the
+    action is unchecked instead of implying it was verified.
+    """
+    if not str(tool_name).startswith("browser."):
+        return None
+    manager = (services or {}).get("browser")
+    if manager is None:
+        return None
+    try:
+        result = manager.screenshot(
+            str(args.get("profile", "") or ""),
+            name=f"after-{str(tool_name).split('.')[-1]}",
+        )
+    except Exception:  # a verification must never break the action it checks
+        return None
+    if not getattr(result, "ok", False):
+        return None
+    path = (getattr(result, "data", None) or {}).get("path")
+    if not path:
+        return None
+    return f"the page was captured afterwards ({path}); compare it with what was expected"

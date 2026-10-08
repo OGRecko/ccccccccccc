@@ -92,6 +92,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         category=CATEGORY,
         readonly=True,
         path_args=("path",),
+        path_base="sandbox",
         example="files.list(path='.', pattern='*.md')",
     )
     def files_list(path: str = ".", pattern: str = "", recursive: bool = False, limit: int = 100) -> ToolResult:
@@ -138,6 +139,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         category=CATEGORY,
         readonly=True,
         path_args=("path",),
+        path_base="sandbox",
         example="files.read(path='notes.md', lines=40)",
     )
     def files_read(path: str, max_bytes: int = 0, start_line: int = 0, lines: int = 0) -> ToolResult:
@@ -193,6 +195,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         category=CATEGORY,
         readonly=True,
         path_args=("path",),
+        path_base="sandbox",
         example="files.search(query='TODO', path='..', glob='*.md')",
     )
     def files_search(query: str, path: str = ".", glob: str = "*", max_results: int = 40) -> ToolResult:
@@ -244,6 +247,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         category=CATEGORY,
         readonly=True,
         path_args=("path",),
+        path_base="sandbox",
         example="files.stat(path='report.md')",
     )
     def files_stat(path: str) -> ToolResult:
@@ -279,6 +283,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         tier=YELLOW,
         category=CATEGORY,
         path_args=("path",),
+        path_base="sandbox",
         spoken_action=lambda a: f"write the file {a.get('path', '')}",
         example="files.write(path='notes/todo.md', text='- ship it', mode='append')",
     )
@@ -321,6 +326,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         tier=YELLOW,
         category=CATEGORY,
         path_args=("path",),
+        path_base="sandbox",
         spoken_action=lambda a: f"create the folder {a.get('path', '')}",
     )
     def files_mkdir(path: str) -> ToolResult:
@@ -351,6 +357,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         tier=YELLOW,
         category=CATEGORY,
         path_args=("source", "destination"),
+        path_base="sandbox",
         spoken_action=lambda a: f"copy {a.get('source', '')} to {a.get('destination', '')}",
         guard=lambda args: (
             (
@@ -402,6 +409,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         tier=YELLOW,
         category=CATEGORY,
         path_args=("source", "destination"),
+        path_base="sandbox",
         spoken_action=lambda a: f"move {a.get('source', '')} to {a.get('destination', '')}",
         guard=lambda args: (
             (
@@ -452,6 +460,7 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         tier=RED,
         category=CATEGORY,
         path_args=("path",),
+        path_base="sandbox",
         spoken_action=lambda a: f"delete the file {a.get('path', '')}",
         guard=lambda args: (
             ("blocked", "refusing to delete a whole allowlisted root folder")

@@ -84,6 +84,12 @@ class Tool:
     content_args: tuple[str, ...] = ()
     #: Args holding filesystem paths: the gate checks them against the allowlists.
     path_args: tuple[str, ...] = ()
+    #: Where this tool resolves *relative* paths, so the gate can check and
+    #: verify the same file the tool actually touches. "" = like the shell
+    #: (shell.default_cwd); "sandbox" = files.sandbox_dir (what tools/files.py
+    #: does). A mismatch here means the gate inspects a different file than the
+    #: tool wrote, which is how a working write can look like a failed one.
+    path_base: str = ""
     #: Args holding URLs/domains: the gate checks them against allowed_sites.
     url_args: tuple[str, ...] = ()
     #: Args holding a command line: the gate checks the executable allowlist and
@@ -203,6 +209,7 @@ class ToolRegistry:
         readonly: bool = False,
         content_args: tuple[str, ...] = (),
         path_args: tuple[str, ...] = (),
+        path_base: str = "",
         url_args: tuple[str, ...] = (),
         command_args: tuple[str, ...] = (),
         guard: "Callable[[dict[str, Any]], tuple[str | None, str]] | None" = None,
@@ -226,6 +233,7 @@ class ToolRegistry:
                     readonly=readonly,
                     content_args=content_args,
                     path_args=path_args,
+                    path_base=path_base,
                     url_args=url_args,
                     command_args=command_args,
                     guard=guard,

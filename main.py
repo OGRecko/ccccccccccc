@@ -114,6 +114,11 @@ class Garvis:
         self.setup_browser()
         self.setup_screen()
         self.services["notifier"] = self.notify
+        # Verification (requirement 6): a browser click cannot be re-read from
+        # disk, so after one the gate asks for a screenshot of the page. The
+        # hook is registered here because the browser manager exists by now;
+        # file tools are checked by the gate itself, without any hook.
+        self.services["verifier"] = self._verify_action
         self.gate = self._build_gate()
         self.services["gate"] = self.gate
         self.setup_ui()
@@ -143,6 +148,16 @@ class Garvis:
             console_style=cfg.get("logging.console_style", "compact"),
         )
         return configure_activity_logger(cfg)
+
+    def _verify_action(self, tool_name: str, args: dict[str, Any]) -> str | None:
+        """Post-action evidence for tools whose result cannot be re-read.
+
+        Returns None when there is nothing to add; the gate then reports the
+        action as unchecked rather than letting it pass as verified.
+        """
+        from core.browser import after_action_note
+
+        return after_action_note(self.services, tool_name, args)
 
     def _build_gate(self) -> Any | None:
         """The permission gate is mandatory. If it is missing, we fail closed:

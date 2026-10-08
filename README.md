@@ -70,7 +70,7 @@ exactly what to install if something is missing.**
 | Safety | GREEN/YELLOW/RED permission gate, allowlists, password refusal, instant kill switch (hotkey + tray button + spoken phrase), prompt-injection fencing, verification of state-changing actions |
 | Reliability | Every tool has a timeout, one retry then an honest report; task state is written as it goes, so a crash or a deliberate quit can be resumed; rollback is described, never executed blind |
 | UI | Tray icon with a STOP button, an always-on-top status overlay, and a terminal status line when there is no desktop |
-| Self-test | `python tests/self_test.py` checks 19 areas and prints what to fix |
+| Self-test | `python tests/self_test.py` checks 20 areas and prints what to fix |
 
 ---
 
@@ -409,7 +409,14 @@ Rules the code enforces, not the prompt:
 - **The kill switch.** `Ctrl+Alt+Esc`, the tray STOP button and the spoken
   stop phrase all call the same switch: it interrupts the model mid-answer,
   stops and mutes speech, halts every open browser profile, stops screen
-  guidance, and shows a red STOPPED status until you resume.
+  guidance, shows a red STOPPED status until you resume — and **terminates any
+  command that is still running**. Commands run in their own process group, so
+  the whole group is signalled: `SIGTERM` first, then `SIGKILL` after
+  `safety.stop_grace_s` (0.5 s) if anything is still alive (`taskkill /T /F` on
+  Windows). The tool then reports "Stopped by the kill switch" rather than
+  pretending the command finished. What it cannot do: un-run something already
+  finished, or cancel a call already inside a third-party function (a
+  screenshot backend, a Playwright action) — those end when that call returns.
 
 Logs: everything is appended to `logs/activity_log.txt` (human-readable) and
 `logs/activity_log-YYYY-MM-DD.jsonl` (machine-readable), with credentials
@@ -531,12 +538,14 @@ root.
 ## Tests and demos
 
 ```bash
-.venv/bin/pytest tests/ -q                 # the full suite: 409 passed, 1 skipped (~55 s)
+.venv/bin/pytest tests/ -q                 # the full suite: 424 passed, 1 skipped (~75 s)
 .venv/bin/pytest tests/test_stage3_permissions.py -v   # one stage
 ```
 
-Every build stage has its own tests (stage 1 → 9), and there are offline demos
-that need no model, no microphone and no display:
+Every build stage has its own tests (stage 1 → 9), plus
+`tests/test_killswitch_work.py`, which runs real processes, presses stop, and
+checks they really died. There are also offline demos that need no model, no
+microphone and no display:
 
 | Demo | Shows |
 |---|---|

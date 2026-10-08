@@ -8,6 +8,8 @@ permission gate (core/permissions.py) does the real work:
 * command substitution (``$(...)``, backticks) is refused by default: it is the
   classic way to smuggle an unlisted command past a first-token check;
 * output redirection is refused unless the target is inside a write-allowed folder;
+* every command runs in its own process group and is registered with the kill
+  switch, so "stop everything" terminates a command that is still running;
 * the process runs with a timeout, captured output, and a filtered environment -
   no inherited secrets, no interactive prompts, no network tools that are not
   explicitly allowlisted.
@@ -48,6 +50,29 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         # Keep tools that expect a language environment working.
         env.setdefault("PYTHONIOENCODING", "utf-8")
         return env
+
+    def _end_process(proc: Any) -> None:
+        """Kill a process we started (timeout path). The group dies with it."""
+        try:
+            if sys.platform != "win32" and hasattr(os, "killpg"):
+                os.killpg(os.getpgid(proc.pid), 15)
+            else:
+                proc.terminate()
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                if sys.platform != "win32" and hasattr(os, "killpg"):
+                    os.killpg(os.getpgid(proc.pid), 9)
+                else:
+                    proc.kill()
+            except Exception:
+                pass
 
     def truncate(text: str) -> str:
         if len(text) <= max_output:
@@ -105,32 +130,65 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
                 return ToolResult.failure(f"Could not parse the command: {exc}")
 
         started = time.perf_counter()
+        # Popen (not subprocess.run) so the command can be registered with the
+        # kill switch: "stop everything" must actually kill a running command,
+        # not just refuse to run the next one. start_new_session puts the shell
+        # and everything it spawns in one process group, which is what makes
+        # that termination complete.
         try:
-            completed = subprocess.run(  # noqa: S602 - shell use is gated above
+            proc = subprocess.Popen(  # noqa: S602 - shell use is gated above
                 argv,
                 shell=needs_shell,
                 cwd=str(workdir),
                 env=build_env(),
-                input=(stdin_text or None),
-                capture_output=True,
+                stdin=subprocess.PIPE if stdin_text else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
                 errors="replace",
                 start_new_session=(sys.platform != "win32"),
-            )
-        except subprocess.TimeoutExpired:
-            return ToolResult.failure(
-                f"Command timed out after {timeout:.0f}s and was killed: {text}"
             )
         except FileNotFoundError as exc:
             return ToolResult.failure(f"Executable not found: {exc}")
         except OSError as exc:
             return ToolResult.failure(f"Could not run the command: {exc}")
 
+        switch = services.get("killswitch")
+        token = switch.register_process(proc, f"shell.run: {text[:60]}") if switch is not None else None
+        timed_out = False
+        try:
+            try:
+                out_text, err_text = proc.communicate(input=(stdin_text or None), timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _end_process(proc)
+                try:
+                    out_text, err_text = proc.communicate(timeout=5)
+                except Exception:
+                    out_text, err_text = "", ""
+            except Exception as exc:                      # never leave a process behind
+                _end_process(proc)
+                return ToolResult.failure(f"Could not run the command: {exc}")
+        finally:
+            if switch is not None and token is not None:
+                switch.unregister_process(token)
+
         elapsed = (time.perf_counter() - started) * 1000
-        stdout = truncate(completed.stdout or "")
-        stderr = truncate(completed.stderr or "")
-        parts = [f"$ {text}", f"exit code: {completed.returncode}", f"duration: {elapsed:.0f} ms"]
+        stopped = switch is not None and getattr(switch, "frozen", False)
+        if timed_out and not stopped:
+            return ToolResult.failure(
+                f"Command timed out after {timeout:.0f}s and was killed: {text}"
+            )
+        if stopped and (timed_out or proc.returncode != 0):
+            # Say what actually happened, and by whose order.
+            return ToolResult.failure(
+                f"Stopped by the kill switch before it finished (exit code {proc.returncode}): "
+                f"{text}"
+            )
+
+        stdout = truncate(out_text or "")
+        stderr = truncate(err_text or "")
+        parts = [f"$ {text}", f"exit code: {proc.returncode}", f"duration: {elapsed:.0f} ms"]
         if stdout.strip():
             parts.append("--- stdout ---\n" + stdout.rstrip())
         if stderr.strip():
@@ -139,10 +197,10 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
             parts.append("(no output)")
 
         body = "\n".join(parts)
-        if completed.returncode != 0:
+        if proc.returncode != 0:
             # Honest reporting: a non-zero exit is a failure, not a success with notes.
             return ToolResult.failure(
-                f"Command exited with code {completed.returncode}.",
+                f"Command exited with code {proc.returncode}.",
                 content=body,
             )
         return ToolResult.success(body, display=f"ran: {text[:60]} (exit 0)")

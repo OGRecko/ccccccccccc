@@ -379,6 +379,7 @@ safety:
     - "stop everything"
     - "abort"
   tool_timeout_s: 60             # default timeout for any tool without its own
+  stop_grace_s: 0.5              # "stop everything": grace before SIGKILL on a running command
   tool_retries: 1                # one retry, then report the failure honestly
   confirm_timeout_s: 30
   max_consecutive_errors: 3      # after this many, GARVIS stops and asks

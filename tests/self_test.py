@@ -102,6 +102,13 @@ class Ctx:
             # instead, so the test's own output stays readable and the messages
             # can be asserted on.
             self.app.services["notifier"] = self.notices.append
+            # A self-test must never wait for a human at the keyboard. Every
+            # approval is scripted - and the script still has to satisfy the RED
+            # rules, which is what the permissions check verifies.
+            if self.app.gate is not None:
+                from core.permissions import ScriptedConfirmer  # noqa: PLC0415
+
+                self.app.gate.confirmer = ScriptedConfirmer(approve_all=True)
         return self.app
 
     def service(self, name: str) -> Any:
@@ -305,6 +312,7 @@ def check_permissions(ctx: Ctx) -> Result:
 
     from core.permissions import ALLOWED, BLOCKED, CONFIRMED, DENIED, ScriptedConfirmer
 
+    original_confirmer = gate.confirmer
     problems: list[str] = []
     evidence: dict[str, Any] = {}
 
@@ -350,6 +358,8 @@ def check_permissions(ctx: Ctx) -> Result:
     if not ks.matches_kill_phrase("garvis, stop everything") or ks.matches_kill_phrase("nice weather"):
         problems.append("the spoken stop phrase matcher is not working")
     evidence["hotkey"] = str(ctx.cfg.get("hotkeys.killswitch", "Ctrl+Alt+Esc"))
+
+    gate.confirmer = original_confirmer        # leave the gate as we found it
 
     if problems:
         return _fail("permissions", "; ".join(problems),
@@ -725,6 +735,97 @@ def check_killswitch(ctx: Ctx) -> Result:
                status=status)
 
 
+def check_stop_kills_work(ctx: Ctx) -> Result:
+    """Start a real command, press stop, and check it is dead.
+
+    "Stop everything" is only worth anything if it stops work that is already
+    running, so this is not a unit test with a fake process: it runs a real
+    command through the real gate and the real shell tool, stops it, and then
+    checks the process is gone and did not finish what it was doing.
+    """
+    import threading
+    import time as _time
+
+    from core.killswitch import KillSwitch
+
+    app = ctx.services()
+    gate = app.gate
+    if gate is None:
+        return _skip("stop kills work", "no permission gate, so no tools can run")
+
+    sandbox = Path(str(app.cfg.get("files.sandbox_dir")))
+    if not sandbox.is_absolute():
+        sandbox = app.cfg.resolve_path(sandbox)
+    sandbox.mkdir(parents=True, exist_ok=True)
+    marker = sandbox / "self-test-stopped-work.txt"
+    marker.unlink(missing_ok=True)
+
+    from core.permissions import ScriptedConfirmer
+
+    switch = KillSwitch(app.cfg, activity=app.activity)
+    original = app.services.get("killswitch")
+    original_confirmer = gate.confirmer
+    app.services["killswitch"] = switch          # tools register their children here
+    gate.confirmer = ScriptedConfirmer(approve_all=True)   # never wait for a human
+    command = (
+        "python3 -c \"import time, pathlib; time.sleep(20); "
+        "pathlib.Path('self-test-stopped-work.txt').write_text('finished')\""
+    )
+    box: dict[str, object] = {}
+
+    def worker() -> None:
+        started = _time.perf_counter()
+        try:
+            box["outcome"] = gate.execute("shell.run", {"command": command, "timeout_s": 45})
+        except Exception as exc:
+            box["error"] = exc
+        box["seconds"] = _time.perf_counter() - started
+
+    thread = threading.Thread(target=worker, name="selftest-stop", daemon=True)
+    thread.start()
+    registered = False
+    deadline = _time.time() + 10
+    while _time.time() < deadline:
+        if switch.running_processes():
+            registered = True
+            break
+        _time.sleep(0.05)
+    if not registered:
+        thread.join(5)
+        app.services["killswitch"] = original
+        gate.confirmer = original_confirmer
+        detail = f"the command never registered with the kill switch ({box.get('error') or box.get('outcome')})"
+        return _fail("stop kills work", detail,
+                     "check tools/shell.py registers its process with the kill switch")
+
+    switch.trigger("self-test", source="self-test")
+    thread.join(20)
+    _time.sleep(1.5)                     # give a survivor the chance to write its marker
+    still_running = thread.is_alive()
+    finished_anyway = marker.exists()
+    stopped = switch.last_stop.extra.get("terminated_processes") or []
+    switch.resume("self-test over")
+    app.services["killswitch"] = original
+    gate.confirmer = original_confirmer
+    marker.unlink(missing_ok=True)
+
+    if still_running or finished_anyway or not stopped:
+        return _fail(
+            "stop kills work",
+            "a running command survived the stop"
+            + (" (the tool never returned)" if still_running else "")
+            + (" (it finished anyway)" if finished_anyway else ""),
+            "this is a safety bug: check core/killswitch.py stop_processes() and "
+            "tools/shell.py",
+        )
+    seconds = float(box.get("seconds") or 0)
+    return _ok(
+        "stop kills work",
+        f"a running command was terminated {seconds:.1f}s in, before it could finish "
+        f"({len(stopped)} process group(s))",
+    )
+
+
 # ---------------------------------------------------------------------------
 # 9. the startup routine itself
 # ---------------------------------------------------------------------------
@@ -764,6 +865,7 @@ CHECKS: tuple[tuple[str, Callable[[Ctx], Result], bool], ...] = (
     ("screen", check_screen, False),
     ("ui", check_ui, True),
     ("kill switch", check_killswitch, True),
+    ("stop kills work", check_stop_kills_work, True),
     ("wake up", check_wake_up, True),
 )
 

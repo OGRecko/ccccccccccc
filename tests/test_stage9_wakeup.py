@@ -247,7 +247,8 @@ def test_the_quick_self_test_reports_every_area(cfg) -> None:
     code, report = _run_quick(cfg)
     assert code == 0
     for area in ("environment", "packages", "config", "logging", "memory", "permissions",
-                 "sandbox", "tools", "state", "ui", "kill switch", "wake up"):
+                 "sandbox", "tools", "state", "ui", "kill switch", "stop kills work",
+                 "wake up"):
         assert area in report, area
 
 
@@ -332,3 +333,11 @@ class _App:
         self.services: dict[str, Any] = {}
         self.activity = kwargs.get("activity")
         self.cfg = kwargs.get("cfg")
+
+
+def test_the_self_test_proves_a_running_command_can_be_stopped(cfg) -> None:
+    """"Stop everything" is a safety claim; the self-test must really test it."""
+    ctx = st.Ctx(cfg, quick=True)
+    result = st.check_stop_kills_work(ctx)
+    assert result.status == st.PASS, result.detail
+    assert "terminated" in result.detail

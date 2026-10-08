@@ -482,7 +482,15 @@ Rules the code enforces, not the prompt:
   (the tray item, the hotkey, or the word) is the only way back, and it is
   recorded in the audit trail like every other decision. A call abandoned at its
   timeout whose command is still running stays registered with the switch, so a
-  later STOP kills that too — tested end to end in `tests/test_abandoned_work.py`.
+  later STOP kills that too. Process creation and registration are one atomic
+  hand-off: STOP cannot snapshot an empty registry while `Popen` is in progress.
+  Approval waiting at the prompt and process starts still queued when STOP fires
+  carry the stop generation; even STOP followed by an immediate resume cannot
+  revive that old action. A stop record names the operation/executable, never its
+  full argv (which can contain credentials), and a process that already exited
+  is not falsely counted as killed just because its worker has not cleaned up
+  yet. These races are pinned by
+  `tests/test_abandoned_work.py` and `tests/test_stop_confirmation_race.py`.
 
 Logs: everything is appended to `logs/activity_log.txt` (human-readable) and
 `logs/activity_log-YYYY-MM-DD.jsonl` (machine-readable), with credentials
@@ -605,17 +613,18 @@ root.
 ## Tests and demos
 
 ```bash
-.venv/bin/pytest tests/ -q                 # the full suite: 593 passed, 1 skipped (~120 s)
+.venv/bin/pytest tests/ -q                 # the full suite: 600 passed, 1 skipped (~120 s)
 .venv/bin/pytest tests/test_stage3_permissions.py -v   # one stage
 ```
 
-Every build stage has its own tests (stage 1 → 9), plus three suites that test
-the *guarantees* rather than the features:
+Every build stage has its own tests (stage 1 → 9), plus focused suites that test
+the *guarantees* rather than just the features:
 
 - `tests/test_killswitch_work.py` runs real processes, presses stop, and checks
-  they really died (including a grandchild that ignores `SIGTERM`).
+  they really died (including a grandchild that ignores `SIGTERM`), and checks
+  the audit does not claim it killed a process that had already exited.
 - `tests/test_log_privacy.py` writes canaries into files, reads them with the
-  real tools, and then searches both logs for them.
+  real tools, and then searches both logs and the kill-switch event for them.
 - `tests/test_verification.py` puts tools that *lie* into the registry — they
   return success without doing anything — and checks that the lie is caught,
   reported as a failure, and written to the log as one.
@@ -623,6 +632,9 @@ the *guarantees* rather than the features:
   bomb client (nothing constructs one), that a missing key stays local, that a
   fallback turn cannot act without `allow_tools`, and that the API key never
   reaches a log.
+- `tests/test_stop_confirmation_race.py` pauses the real gate at confirmation
+  and process creation, presses STOP in each gap (including STOP/resume), and
+  checks no stale action starts or escapes the process registry.
 - `tests/test_abandoned_work.py` covers the two features that had to compose: a
   call abandoned at its timeout, whose command is still running — STOP must kill
   it — and a call arriving *while* stopped, which must never start anything.

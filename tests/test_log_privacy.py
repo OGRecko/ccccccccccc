@@ -216,3 +216,48 @@ def test_removing_the_config_patterns_still_protects(cfg) -> None:
     for text in ("password = hunter2", "the token is abc123", "my pin is 4321",
                  "ghp_" + "a" * 36, "sk-" + "b" * 32, "AKIAIOSFODNN7EXAMPLE"):
         assert logger.redactor(text) == "[REDACTED]" or "[REDACTED]" in logger.redactor(text), text
+
+
+def test_a_stop_event_does_not_expose_secrets_from_the_command_line(cfg, activity) -> None:
+    """Process labels are shown in StopEvent.extra and must be safe to display."""
+    import threading
+    import time
+
+    from core.killswitch import KillSwitch
+    from core.logger import get_logger
+
+    canary = "CANARY-KS-91d3a7"
+    switch = KillSwitch(cfg, activity=activity, log=get_logger("killswitch"))
+    services = {"activity": activity, "killswitch": switch}
+    registry = build_registry(cfg, None, services)
+    gate = PermissionGate(
+        cfg=cfg, activity=activity, services={**services, "registry": registry},
+        confirmer=ScriptedConfirmer(approve_all=True), registry=registry,
+    )
+    command = f'python3 -c "import time; password=\'{canary}\'; time.sleep(30)"'
+    box = {}
+    worker = threading.Thread(
+        target=lambda: box.setdefault(
+            "outcome", gate.execute("shell.run", {"command": command, "timeout_s": 40})
+        ),
+        daemon=True,
+    )
+    worker.start()
+    deadline = time.monotonic() + 5
+    while not switch.running_processes() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert switch.running_processes(), "the test command never registered"
+
+    event = switch.trigger("privacy test", source="test")
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "the command did not return after STOP"
+    assert canary not in repr(event.extra), "StopEvent exposed a credential-bearing command label"
+
+    log_paths = [
+        cfg.resolve_path(cfg.get("logging.activity_log")),
+        cfg.resolve_path(cfg.get("logging.activity_jsonl")),
+        cfg.resolve_path(cfg.get("logging.file")),
+    ]
+    logs = "".join(path.read_text(encoding="utf-8", errors="replace")
+                    for path in log_paths if path.exists())
+    assert canary not in logs, "stopping the command wrote its credential to a log"

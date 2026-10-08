@@ -42,9 +42,10 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Protocol
+from typing import Any, Iterable, Protocol
 
 from core import safety
+from core.killswitch import KillSwitchStopped
 
 GREEN = "green"
 YELLOW = "yellow"
@@ -587,9 +588,6 @@ class PermissionGate:
 
     def add_confirmer(self, confirmer: Confirmer, first: bool = True) -> None:
         """Register another channel (voice, UI). Later stages call this."""
-        existing = list(getattr(self.confirmer, "confirmers", [])) or (
-            [self.confirmer] if self.confirmer else []
-        )
         if isinstance(self.confirmer, ConfirmerChain):
             self.confirmer.confirmers.insert(0 if first else len(self.confirmer.confirmers), confirmer)
         else:
@@ -1029,6 +1027,25 @@ class PermissionGate:
         return was_tripped
 
     # -- execution ---------------------------------------------------------
+    def _stop_refusal(self, tool_name: str, args: dict[str, Any], started: float,
+                      sensitive: bool = False) -> GateOutcome:
+        """Record a call cancelled by the kill switch and tell the model how to recover."""
+        outcome = GateOutcome(
+            ok=False, tool=tool_name, tier=RED, decision=STOPPED,
+            content="Stopped: the kill switch is engaged, so nothing runs. Tell the "
+                    "user the stop is still on and that saying 'resume' ends it - do "
+                    "not retry, and do not look for another route.",
+            display="stopped by the kill switch",
+        )
+        outcome.duration_ms = (time.perf_counter() - started) * 1000
+        self._record(tool=tool_name, args=self._log_args(tool_name, args), tier=RED,
+                     decision=STOPPED, note="the kill switch is engaged",
+                     sensitive=sensitive)
+        with self._lock:
+            self.stats[STOPPED] = self.stats.get(STOPPED, 0) + 1
+        self._notify("I am stopped. Say 'resume' when you want me to carry on.")
+        return outcome
+
     def execute(self, tool_name: str, args: dict[str, Any] | None = None) -> GateOutcome:
         """The single entry point for running a tool."""
         args = dict(args or {})
@@ -1036,25 +1053,13 @@ class PermissionGate:
 
         with self._lock:
             switch = self.services.get("killswitch")
+            start_stop_count = getattr(switch, "stop_count", None) if switch is not None else None
             if switch is not None and getattr(switch, "frozen", False):
-                # "stop everything" has to mean *everything*, and this is the one
-                # door every tool call goes through. handle_line already refuses
-                # to send a frozen session's text to the model, so this is the
-                # second lock on the same door: a UI button, a worker thread or a
-                # future caller cannot quietly run a tool after a stop.
-                outcome = GateOutcome(
-                    ok=False, tool=tool_name, tier=RED, decision=STOPPED,
-                    content="Stopped: the kill switch is engaged, so nothing runs. Tell the "
-                            "user the stop is still on and that saying 'resume' ends it - do "
-                            "not retry, and do not look for another route.",
-                    display="stopped by the kill switch",
-                )
-                outcome.duration_ms = (time.perf_counter() - started) * 1000
-                self._record(tool=tool_name, args=self._log_args(tool_name, args), tier=RED,
-                             decision=STOPPED, note="the kill switch is engaged")
-                self.stats[STOPPED] = self.stats.get(STOPPED, 0) + 1
-                self._notify("I am stopped. Say 'resume' when you want me to carry on.")
-                return outcome
+                # "Stop everything" has to mean *everything*, and this is the one
+                # door every tool call goes through. handle_line also keeps frozen
+                # text away from the model; the gate protects calls from UI buttons,
+                # worker threads, and future callers.
+                return self._stop_refusal(tool_name, args, started)
 
             if self._consecutive_errors >= self.max_consecutive_errors:
                 outcome = GateOutcome(
@@ -1116,10 +1121,22 @@ class PermissionGate:
                     sensitive=sensitive,
                 )
 
+        # The user may have pressed STOP while the confirmation prompt was open.
+        # Check both the current state and the generation: even a quick STOP/resume
+        # cancels the call that was awaiting approval; resume does not restart it.
+        if switch is not None and (
+            getattr(switch, "frozen", False)
+            or (start_stop_count is not None
+                and getattr(switch, "stop_count", start_stop_count) != start_stop_count)
+        ):
+            return self._stop_refusal(tool_name, args, started, sensitive=sensitive)
+
         # Run it.
-        outcome = self._run_tool(tool, args, tier, started)
-        outcome.tier = tier
+        outcome = self._run_tool(tool, args, tier, started, start_stop_count)
+        outcome.tier = RED if outcome.decision == STOPPED else tier
         outcome.duration_ms = (time.perf_counter() - started) * 1000
+        if outcome.decision == STOPPED:
+            outcome.refresh_for_model()
 
         with self._lock:
             if outcome.ok:
@@ -1130,7 +1147,13 @@ class PermissionGate:
         self.stats[outcome.decision] = self.stats.get(outcome.decision, 0) + 1
         # GREEN runs get a permission record here; YELLOW/RED already have their
         # asked/confirmed/denied records from the confirmation step.
-        if tier == GREEN:
+        if outcome.decision == STOPPED:
+            self._record(
+                tool=tool_name, args=self._log_args(tool_name, args), tier=RED,
+                decision=STOPPED, note="the kill switch stopped this request before it ran",
+                sensitive=sensitive,
+            )
+        elif tier == GREEN:
             self._record(
                 tool=tool_name, args=self._log_args(tool_name, args), tier=tier,
                 decision=outcome.decision,
@@ -1144,17 +1167,20 @@ class PermissionGate:
                     result=(outcome.content or "")[:1500],
                     ok=outcome.ok,
                     duration_ms=outcome.duration_ms,
-                    tier=tier,
+                    tier=outcome.tier,
                     sensitive=sensitive,
                 )
             except Exception:
                 pass
 
-        if not outcome.ok:
+        if outcome.decision == STOPPED:
+            self._notify("I am stopped. Say 'resume' when you want me to carry on.")
+        elif not outcome.ok:
             self._notify(f"{tool_name} failed: {(outcome.error or '')[:200]}")
         return outcome
 
-    def _run_tool(self, tool: Any, args: dict[str, Any], tier: str, started: float) -> GateOutcome:
+    def _run_tool(self, tool: Any, args: dict[str, Any], tier: str, started: float,
+                  stop_count: int | None = None) -> GateOutcome:
         timeout = float(tool.timeout_s or self.default_timeout)
         before = self._snapshot_state(tool, args)
         attempts = 0
@@ -1162,7 +1188,20 @@ class PermissionGate:
         while attempts <= self.max_retries:
             attempts += 1
             try:
-                result = self._call_with_timeout(tool, args, timeout)
+                result = self._call_with_timeout(tool, args, timeout, stop_count)
+            except KillSwitchStopped as exc:
+                outcome = GateOutcome(
+                    ok=False, tool=tool.name, tier=RED, decision=STOPPED,
+                    content=("Stopped: the kill switch cancelled this request before the tool "
+                             "started. Tell the user the stop remains in effect until they say "
+                             "'resume'; do not retry or find another route."),
+                    display="stopped by the kill switch",
+                    error=str(exc),
+                    ran=False,
+                )
+                outcome.attempts = attempts
+                outcome.duration_ms = (time.perf_counter() - started) * 1000
+                return outcome
             except TimeoutError:
                 outcome = GateOutcome(
                     ok=False, tool=tool.name, tier=tier, decision=TIMEOUT,
@@ -1217,7 +1256,8 @@ class PermissionGate:
         return GateOutcome(ok=False, tool=tool.name, tier=tier, decision=ERROR,
                            content=f"'{tool.name}' failed: {last_error}", error=last_error)
 
-    def _call_with_timeout(self, tool: Any, args: dict[str, Any], timeout: float) -> Any:
+    def _call_with_timeout(self, tool: Any, args: dict[str, Any], timeout: float,
+                           stop_count: int | None = None) -> Any:
         """Run a tool with a hard deadline.
 
         A hung tool cannot be killed in Python, so the worker is a daemon thread
@@ -1228,7 +1268,17 @@ class PermissionGate:
 
         def worker() -> None:
             try:
-                box.put((True, tool.run(args)))
+                switch = self.services.get("killswitch")
+                if switch is not None and hasattr(switch, "task_scope"):
+                    with switch.task_scope(stop_count):
+                        value = tool.run(args)
+                else:
+                    # Compatibility for small test doubles and standalone gates:
+                    # the real application always supplies KillSwitch.task_scope.
+                    if switch is not None and getattr(switch, "frozen", False):
+                        raise KillSwitchStopped("the kill switch is engaged")
+                    value = tool.run(args)
+                box.put((True, value))
             except BaseException as exc:  # noqa: BLE001 - re-raised in the caller
                 box.put((False, exc))
 

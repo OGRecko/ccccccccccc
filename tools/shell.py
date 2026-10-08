@@ -130,13 +130,10 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
                 return ToolResult.failure(f"Could not parse the command: {exc}")
 
         started = time.perf_counter()
-        # Popen (not subprocess.run) so the command can be registered with the
-        # kill switch: "stop everything" must actually kill a running command,
-        # not just refuse to run the next one. start_new_session puts the shell
-        # and everything it spawns in one process group, which is what makes
-        # that termination complete.
-        try:
-            proc = subprocess.Popen(  # noqa: S602 - shell use is gated above
+        switch = services.get("killswitch")
+
+        def launch() -> subprocess.Popen:
+            return subprocess.Popen(  # noqa: S602 - shell use is gated above
                 argv,
                 shell=needs_shell,
                 cwd=str(workdir),
@@ -148,13 +145,24 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
                 errors="replace",
                 start_new_session=(sys.platform != "win32"),
             )
+
+        # Popen (not subprocess.run) so the command can be registered with the
+        # kill switch. start_process makes OS process creation and registration
+        # atomic with STOP: otherwise STOP could snapshot an empty registry after
+        # Popen began but before its process handle was registered, then miss the
+        # command entirely. start_new_session puts the shell and its children in
+        # one process group so termination reaches the whole command.
+        try:
+            if switch is not None and hasattr(switch, "start_process"):
+                proc, token = switch.start_process(launch, "shell.run")
+            else:
+                proc = launch()
+                token = (switch.register_process(proc, "shell.run")
+                         if switch is not None else None)
         except FileNotFoundError as exc:
             return ToolResult.failure(f"Executable not found: {exc}")
         except OSError as exc:
             return ToolResult.failure(f"Could not run the command: {exc}")
-
-        switch = services.get("killswitch")
-        token = switch.register_process(proc, f"shell.run: {text[:60]}") if switch is not None else None
         timed_out = False
         try:
             try:

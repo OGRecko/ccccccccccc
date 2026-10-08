@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import re
+from contextlib import contextmanager
 import shutil
 import signal
 import subprocess
@@ -35,7 +36,9 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
+
+from core.logger import redact
 
 
 @dataclass
@@ -56,15 +59,18 @@ def _is_running(proc: Any) -> bool:
 
 
 def _describe_process(proc: Any) -> str:
-    """A short, log-safe name for a process: what it was, not its full command."""
+    """Identify a child by executable only; argv can contain credentials."""
     args = getattr(proc, "args", None)
     pid = getattr(proc, "pid", "?")
     if isinstance(args, (list, tuple)) and args:
-        name = " ".join(str(part) for part in args[:3])
+        executable = str(args[0])
     elif isinstance(args, str):
-        name = args
+        executable = args.strip().split(maxsplit=1)[0] if args.strip() else ""
     else:
-        name = "process"
+        executable = ""
+    # Basename only: neither the working directory nor the executable path is
+    # useful in the STOP message, and both can contain a user's private paths.
+    name = executable.replace("\\", "/").rsplit("/", 1)[-1] or "process"
     return f"pid {pid}: {name[:60]}"
 
 
@@ -128,6 +134,10 @@ def _terminate(proc: Any, grace_s: float = 0.5) -> bool:
     return not _is_running(proc)
 
 
+class KillSwitchStopped(RuntimeError):
+    """A queued/in-flight operation belongs to a stop generation that was cancelled."""
+
+
 class KillSwitch:
     """Global emergency stop."""
 
@@ -150,6 +160,10 @@ class KillSwitch:
         self._processes: dict[int, tuple[Any, str]] = {}
         self._process_lock = threading.RLock()
         self._next_process = 1
+        # The gate runs tools on worker threads. Carry the request's stop_count
+        # into that thread so a STOP followed by an immediate resume cannot make
+        # an old, delayed tool call look like new work.
+        self._task_context = threading.local()
 
     # -- subscription ------------------------------------------------------
     def subscribe(self, callback: Callable[[StopEvent], None]) -> None:
@@ -165,16 +179,77 @@ class KillSwitch:
                     self.log.debug("kill switch subscriber failed", exc_info=True)
 
     # -- child processes ---------------------------------------------------
-    def register_process(self, proc: Any, label: str = "") -> int:
-        """Watch a child process so a stop can terminate it.
+    def _register_process_locked(self, proc: Any, label: str = "") -> int:
+        token = self._next_process
+        self._next_process += 1
+        # A label is a short operation name, never a command line. Keep only its
+        # stable prefix (before the legacy `": command"` separator) and apply the
+        # logger's always-on credential redactor before it reaches StopEvent.extra
+        # or the developer log. Arguments stay in the normal, scrubbed audit path.
+        safe_label = str(label).partition(":")[0].strip() if label else ""
+        safe_label = redact(safe_label)[:60] if safe_label else _describe_process(proc)
+        self._processes[token] = (proc, safe_label)
+        return token
 
-        Returns a token; the caller unregisters it when the process is gone.
+    def register_process(self, proc: Any, label: str = "") -> int:
+        """Watch an already-started child process so a stop can terminate it.
+
+        Prefer ``start_process`` when this object owns the launch: it serializes
+        process creation with STOP, closing the Popen/registration race.
         """
         with self._process_lock:
-            token = self._next_process
-            self._next_process += 1
-            self._processes[token] = (proc, label or _describe_process(proc))
-        return token
+            return self._register_process_locked(proc, label)
+
+    @contextmanager
+    def task_scope(self, expected_stop_count: int | None) -> Iterator[None]:
+        """Mark one gate worker as belonging to the generation that authorized it.
+
+        A STOP increments ``stop_count`` permanently for the session, even if the
+        user resumes before the worker is scheduled. The worker then fails closed
+        rather than running an old request in the new session.
+        """
+        with self._lock:
+            current = self.stop_count
+            expected = current if expected_stop_count is None else expected_stop_count
+            if self._frozen.is_set() or expected != current:
+                raise KillSwitchStopped(
+                    "the kill switch stopped this request before it started; the action was not run"
+                )
+            previous = getattr(self._task_context, "stop_count", None)
+            self._task_context.stop_count = expected
+        try:
+            yield
+        finally:
+            if previous is None:
+                try:
+                    del self._task_context.stop_count
+                except AttributeError:
+                    pass
+            else:
+                self._task_context.stop_count = previous
+
+    def start_process(self, starter: Callable[[], Any], label: str = "") -> tuple[Any, int]:
+        """Start and register a child atomically with respect to STOP.
+
+        The launch callback runs while holding the same lock used by
+        ``stop_processes``. If it obtained the lock first, STOP waits and then
+        sees/kills the registered child; if STOP already engaged, the launch is
+        refused. A gate worker's captured stop generation is checked as well, so
+        STOP+resume cannot revive a stale request.
+        """
+        with self._process_lock:
+            expected = getattr(self._task_context, "stop_count", None)
+            with self._lock:
+                current = self.stop_count
+                frozen = self._frozen.is_set()
+            if frozen or (expected is not None and expected != current):
+                raise KillSwitchStopped(
+                    "the kill switch stopped this request before its command started; "
+                    "the command was not run"
+                )
+            proc = starter()
+            token = self._register_process_locked(proc, label)
+            return proc, token
 
     def unregister_process(self, token: int) -> None:
         with self._process_lock:
@@ -202,7 +277,12 @@ class KillSwitch:
         failed: list[str] = []
         for token, (proc, label) in items:
             name = label or _describe_process(proc)
-            if _is_running(proc) and not _terminate(proc, grace_s):
+            if not _is_running(proc):
+                # A just-finished command can still be registered until its tool
+                # unwinds its `finally`. Forget it, but never claim STOP killed it.
+                self.unregister_process(token)
+                continue
+            if not _terminate(proc, grace_s):
                 failed.append(name)
             else:
                 stopped.append(name)

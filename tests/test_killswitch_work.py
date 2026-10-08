@@ -280,3 +280,47 @@ def test_an_escaped_child_does_not_hang_the_tool(gate, switch, sandbox) -> None:
     assert not box["thread"].is_alive(), "the tool hung waiting for a grandchild"
     assert box["seconds"] < 15, f"took {box['seconds']:.1f}s"
     assert outcome_failed(box["outcome"])
+
+
+def test_fallback_process_description_never_copies_argv_contents() -> None:
+    """Even an unlabelled process may have credentials in its command arguments."""
+    from core.killswitch import _describe_process
+
+    canary = "CANARY-DO-NOT-DESCRIBE"
+
+    class Process:
+        pid = 1234
+        args = ["/usr/bin/python3", "-c", f"password={canary}"]
+
+    description = _describe_process(Process())
+    assert "python3" in description
+    assert canary not in description
+    assert "password" not in description
+
+
+def test_a_finished_process_is_not_falsely_reported_as_terminated(switch) -> None:
+    """A cleanup race is not evidence that STOP killed a command."""
+
+    class Finished:
+        pid = 4242
+        args = ["python3", "-c", "pass"]
+
+        def poll(self) -> int:
+            return 0
+
+        def terminate(self) -> None:
+            raise AssertionError("a completed process must not receive a signal")
+
+        def kill(self) -> None:
+            raise AssertionError("a completed process must not be killed")
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+    switch.register_process(Finished(), "shell.run")
+    event = switch.trigger("test STOP after natural completion", source="test")
+
+    assert "terminated_processes" not in event.extra, (
+        "the audit trail claimed it killed a command which had already exited"
+    )
+    assert switch.running_processes() == []

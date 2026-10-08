@@ -187,3 +187,59 @@ def test_the_shipped_config_still_allows_the_users_own_files() -> None:
     assert any(e == "sandbox" for e in data["files"]["allowed_write"]), (
         "the sandbox must be writable out of the box"
     )
+
+
+# ---------------------------------------------------------------------------
+# warnings: computed, kept, and surfaced (they were silently discarded)
+# ---------------------------------------------------------------------------
+def test_loading_a_config_keeps_its_warnings() -> None:
+    """`validate()` returns a list; the constructor used to throw it away.
+
+    Every config warning in the project was dead because of that one missing
+    assignment: main.py printed nothing at startup and the self-test's config
+    check extended an empty list. The README's promise that `--check` warns about
+    an enabled cloud fallback (and a bad personality, and an empty allowlist)
+    simply did not happen.
+    """
+    from core.config import Config
+
+    config = Config.load(CONFIG_PATH)
+    assert isinstance(config.warnings, list)
+    assert config.warnings, (
+        "the shipped config has at least one standing caveat (the shell allowlist); an empty "
+        "list here means warnings are being discarded again"
+    )
+    assert config.warnings == config.validate(), "the kept list drifted from a fresh check"
+
+
+def test_a_deliberately_broken_config_warns_about_each_problem(cfg) -> None:
+    cfg.set("brain.personality", "nonsense")
+    cfg.set("voice_out.engine", "nonsense")
+    cfg.set("files.allowed_read", [])
+    text = " | ".join(cfg.warnings)
+    assert "personality" in text
+    assert "voice_out.engine" in text
+    assert "allowed_read is empty" in text
+
+
+def test_a_runtime_change_refreshes_the_warnings(cfg, monkeypatch) -> None:
+    """`set()` is used for --model and personality swaps; the list must follow."""
+    monkeypatch.delenv("GARVIS_CLOUD_API_KEY", raising=False)
+    assert not any("Cloud fallback is enabled" in w for w in cfg.warnings)
+
+    cfg.set("brain.cloud_fallback.enabled", True)
+
+    assert any("Cloud fallback is enabled" in w for w in cfg.warnings), (
+        "enabling cloud fallback at runtime did not re-run the checks"
+    )
+
+
+def test_the_self_test_reports_the_warnings_it_is_given(cfg) -> None:
+    """The consumer side: a warning must reach the report, not just the list."""
+
+    from tests import self_test as st
+
+    cfg.set("brain.personality", "nonsense")
+    result = st.check_config(st.Ctx(cfg, quick=True))
+    assert result.status == st.WARN
+    assert "personality" in result.detail

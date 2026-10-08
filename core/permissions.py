@@ -537,6 +537,7 @@ class PermissionGate:
         self.yellow_cfg = cfg.section("permissions").get("yellow_confirm", {}) or {}
         self.red_cfg = cfg.section("permissions").get("red_confirm", {}) or {}
         self.denied_globs = [str(g) for g in (cfg.get("files.denied_globs", []) or [])]
+        self._bare_protected = set(_BARE_PROTECTED_PATTERNS) | _bare_protected_patterns(self.denied_globs)
         self.allowed_read = cfg.allowed_folders("read")
         self.allowed_write = cfg.allowed_folders("write")
         self.follow_symlinks = bool(cfg.get("files.follow_symlinks", False))
@@ -818,6 +819,10 @@ class PermissionGate:
                         f"command matches a blocked pattern ({pattern.pattern}); this never runs.",
                     )
 
+            protected = self._protected_token(command)
+            if protected:
+                return Classification(RED, reasons, True, protected)
+
             if not bool(self.cfg.get("shell.allow_substitution", False)):
                 for token in ("$(", "`", "${"):
                     if token in command:
@@ -936,6 +941,57 @@ class PermissionGate:
             if fnmatch.fnmatch(name, simplified) or fnmatch.fnmatch(text, f"*{simplified}"):
                 return True
         return False
+
+    def _protected_token(self, command: str) -> str | None:
+        """Refuse a command whose *arguments* name a protected file.
+
+        The file tools have every path checked against files.denied_globs; the
+        shell checked only the executable, so `cat ~/.ssh/id_rsa` walked past the
+        allowlists and every protected pattern in one step. Two rules close that:
+
+        * a **path-shaped** argument (`~/.ssh/id_rsa`, `./config.yaml`,
+          `/home/x/.aws/credentials`, the value side of `--file=...`) is run
+          through the same matcher the file tools use;
+        * a **file name** from the built-in list (`id_rsa`, `.env`, `config.yaml`,
+          `Login Data`, `Cookies`, ...) or matching a built-in/config extension
+          pattern (`*.key`, `*.pem`) is refused wherever it appears.
+
+        A bare word is only treated as a file name when it is on one of those
+        lists - `grep -rn password src/` is prose and keeps working. What this is
+        *not* is containment: an allowlisted interpreter (`python3 -c`,
+        `node -e`) can reach anything the user's account can, whatever token
+        checks say. The README says so, config.yaml says so beside the allowlist,
+        and --check warns about it, because pretending otherwise would be worse
+        than the gap.
+        """
+        for token in _command_tokens(command):
+            text = token.strip().strip("\"'")
+            if not text:
+                continue
+            if "=" in text:
+                # --file=/path, --output=x, and VAR=value prefixes: judge the value.
+                text = text.split("=", 1)[1].strip().strip("\"'")
+            if not text or text.startswith("-"):
+                continue
+
+            path_shape = text.startswith(("/", "~", ".")) or "/" in text or "\\" in text
+            if path_shape and (self.matches_denied_glob(Path(text))
+                               or self.matches_denied_glob(self.resolve_user_path(text))):
+                return self._protected_reason(text, "a protected pattern")
+
+            name = os.path.basename(text)
+            if name and (name in _BARE_PROTECTED_TOKENS
+                         or any(fnmatch.fnmatch(name, pattern) for pattern in self._bare_protected)):
+                return self._protected_reason(name, "a protected file name")
+        return None
+
+    @staticmethod
+    def _protected_reason(what: str, kind: str) -> str:
+        return (
+            f"the command names {what!r}, which is {kind} (keys, browser cookie stores, "
+            f"GARVIS's own files). Reading those is off limits to every tool, including the "
+            f"shell; this never runs."
+        )
 
     # -- the breaker -------------------------------------------------------
     def breaker_tripped(self) -> bool:
@@ -1586,6 +1642,45 @@ def mask_secrets(args: dict[str, Any], mask: str = "***") -> dict[str, Any]:
     which tool and which arguments, but no value is displayed, logged or spoken.
     """
     return {key: (mask if not isinstance(value, (dict, list, tuple)) else mask) for key, value in args.items()}
+
+
+#: Key formats that stay protected even if files.denied_globs is emptied: these
+#: are the files a leak would be unrecoverable for. Extension patterns *from*
+#: config.yaml are added to this set (see _bare_protected_patterns).
+_BARE_PROTECTED_PATTERNS = ("*.pem", "*.key", "*.kdbx", "*.p12", "*.pfx", "*.ppk")
+
+#: Bare file names that are off limits to a command even without a path around
+#: them. Keys, credential stores and GARVIS's own files - the same promise as
+#: files.denied_globs, applied to arguments that carry no folder.
+_BARE_PROTECTED_TOKENS = frozenset({
+    "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",                          # ssh keys
+    ".netrc", ".htpasswd", ".git-credentials", ".env", ".pgpass",          # credential files
+    "Login Data", "Cookies", "cookies.sqlite", "credentials.json",         # browser stores
+    "config.yaml", "config.local.yaml", "permissions.py", "killswitch.py",
+    "system_prompt.md",                                                    # GARVIS's own files
+})
+
+
+def _command_tokens(command: str) -> list[str]:
+    """Split a command line into tokens, tolerating an unbalanced quote."""
+    try:
+        return shlex.split(command, posix=True)
+    except ValueError:
+        return command.split()
+
+
+def _bare_protected_patterns(denied_globs: Iterable[str]) -> set[str]:
+    """Extension patterns ("*.key") from files.denied_globs, for bare names.
+
+    Derived rather than duplicated, so adding a pattern to config.yaml protects
+    the shell too - the two cannot drift apart.
+    """
+    patterns: set[str] = set()
+    for glob in denied_globs:
+        base = str(glob).replace("**/", "").strip()
+        if base.startswith("*.") and "*" not in base[2:] and "/" not in base[2:]:
+            patterns.add(base)
+    return patterns
 
 
 def _exact_action(tool: Any, args: dict[str, Any]) -> str:

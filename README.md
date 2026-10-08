@@ -92,6 +92,9 @@ Being straight with you matters more than looking impressive:
 - **Only one global hotkey exists** (`Ctrl+Alt+Esc`, stop everything). Push-to-talk,
   personality-cycle and screenshot hotkeys were never implemented; the settings for
   them were removed rather than left in `config.yaml` pretending to work.
+- **The shell is not sandboxed.** An allowlisted program runs as you, with your
+  rights. `python main.py --check` lists the ones that can touch files and tells
+  you how to remove them; what stops regardless is the secrets class above.
 - **It is only as good as the model you run.** A 7B model on a CPU is useful but
   will misread instructions. Tool-calling quality drops fast below 7B.
 - **Screen control is off by default and is the least reliable feature.**
@@ -387,9 +390,20 @@ for a tool; the gate decides.
 
 Rules the code enforces, not the prompt:
 
-- **Allowlists.** Reading and writing happen only inside `files.allowed_read` /
-  `files.allowed_write`. Browsing happens only on `browser.allowed_sites`.
-  Everything else is refused (and reported as such).
+- **Allowlists.** The *file tools* read and write only inside `files.allowed_read` /
+  `files.allowed_write`; browsing happens only on `browser.allowed_sites`; and arguments
+  that name a key, a browser cookie store or one of GARVIS's own files
+  (`files.denied_globs`) are refused for **every** tool — including the shell, so
+  `cat ~/.ssh/id_rsa` and `find . -name '*.pem'` never run, whatever is approved.
+- **Where the boundary is weaker, and why you are told.** `shell.allowlist` is a
+  *separate* list that ends in real programs: once `cat` or `python3` may run, it
+  can reach whatever your user account can — `cat /anywhere` works, and an
+  interpreter can do anything at all. No argument-scanning can close that, so
+  GARVIS does not pretend it has: `python main.py --check` (and every startup
+  log) names the file-capable programs in your allowlist and tells you to remove
+  them if you need those folders to be a hard boundary. The shipped default
+  includes them because they are what makes the assistant useful. Listing a
+  protected folder's names (`ls ~/.ssh`) is not blocked; reading the files is.
 - **Protected patterns.** Even inside an allowed folder: `.ssh`, `.aws`,
   `*.key`, `*.pem`, `.env`, `id_rsa*`, browser `Cookies`/`Login Data`,
   `*password*`, `*secret*`, `*.kdbx`, plus GARVIS's own `config.yaml`,
@@ -582,7 +596,7 @@ root.
 ## Tests and demos
 
 ```bash
-.venv/bin/pytest tests/ -q                 # the full suite: 545 passed, 1 skipped (~105 s)
+.venv/bin/pytest tests/ -q                 # the full suite: 583 passed, 1 skipped (~105 s)
 .venv/bin/pytest tests/test_stage3_permissions.py -v   # one stage
 ```
 
@@ -600,6 +614,11 @@ the *guarantees* rather than the features:
   bomb client (nothing constructs one), that a missing key stays local, that a
   fallback turn cannot act without `allow_tools`, and that the API key never
   reaches a log.
+- `tests/test_shell_paths.py` walks the shell around the allowlists (`cat` on a
+  file inside no allowlist) and pins the *stated* boundary: keys, cookie stores
+  and GARVIS's own files are refused through every phrasing tried, ordinary work
+  like `grep -rn password src/` is untouched, and the part that cannot be closed
+  is asserted as documented reality rather than glossed over.
 - `tests/test_overwrite_guards.py` tries to destroy a file with the weakest
   approval there is (a user who says "yes" to everything) through all three
   clobbering tools, and checks the file survives — then checks that appending,
@@ -616,8 +635,9 @@ the *guarantees* rather than the features:
 - `tests/test_config_coverage.py` enforces that `config.yaml` has no dead knobs
   (every key is read), no hidden knobs (every key the code reads is in the file)
   and no unexplained knobs (every key carries a comment, or its name says
-  everything). `tests/test_config_wiring.py` then proves the settings it covers
-  actually change behaviour. There are also offline demos that need no model, no
+  everything) — and that the warnings `validate()` produces are actually kept and
+  reported, which they were not for a while. `tests/test_config_wiring.py` then
+  proves the settings it covers actually change behaviour. There are also offline demos that need no model, no
 microphone and no display:
 
 | Demo | Shows |

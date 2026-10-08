@@ -198,7 +198,7 @@ files:
   # The first block is the "do not touch my own safety rails" list: the model
   # cannot edit its permissions, its kill switch, or its own prompt.
   denied_globs: ["**/.ssh/**", "**/.aws/**", "**/*.key", "**/*.pem",
-                 "**/.env", "**/id_rsa*", "**/Login Data", "**/Cookies",
+                 "**/.env*", "**/id_rsa*", "**/Login Data", "**/Cookies",
                  "**/credentials.json", "**/*password*", "**/*secret*",
                  "**/config.yaml", "**/config.local.yaml", "**/permissions.py",
                  "**/killswitch.py", "**/system_prompt.md", "**/.netrc",
@@ -214,7 +214,17 @@ shell:
   require_allowlist: true       # true = only executables listed below may run
   allow_substitution: false      # $(...) / backticks are refused: they hide unlisted commands
   allow_redirects: false         # `>` and `>>` only allowed to paths inside allowed_write
-  allowlist:                    # first token of the command must match one of these
+  allowlist:                    # first token of the command must match one of these.
+                                #   READ THIS: the executable allowlist is a weaker
+                                #   boundary than files.allowed_read/write. `cat` and
+                                #   `python3` are programs - once they may run, they can
+                                #   reach whatever your user account can (and an
+                                #   interpreter can do anything). What IS blocked is the
+                                #   secrets class: arguments naming keys, browser cookie
+                                #   stores or GARVIS's own files are refused whatever is
+                                #   approved. Remove the file-capable programs below if
+                                #   you need the folders to be a hard boundary; --check
+                                #   lists them for you.
     - echo, ls, dir, pwd, cat, type, head, tail, wc, grep, find, where, which,
       python, python3, pip, git, node, npm, code, notepad, calc, explorer,
       mkdir, copy, cp, move, mv, curl, wget, tasklist, ps, ipconfig, ifconfig,

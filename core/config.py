@@ -16,6 +16,22 @@ Run ``python main.py --check`` to print a resolved summary of this file.
 
 from __future__ import annotations
 
+#: Programs that can read or write files by themselves, however the file
+#: allowlists are set. Used only to warn honestly (see validate()).
+_FILE_CAPABLE_PROGRAMS = frozenset({
+    # interpreters - arbitrary code, so anything at all
+    "python", "python3", "pythonw", "py", "pip", "pip3", "node", "npm", "npx",
+    "deno", "bun", "perl", "ruby", "php", "lua", "Rscript", "osascript", "java",
+    "powershell", "pwsh", "cmd", "cscript", "wscript", "mshta",
+    # programs whose job is reading, copying or moving files
+    "cat", "type", "more", "less", "head", "tail", "grep", "egrep", "fgrep",
+    "find", "fd", "rg", "sed", "awk", "gawk", "cp", "copy", "mv", "move",
+    "robocopy", "xcopy", "rsync", "tar", "zip", "unzip", "7z", "dd", "tee",
+    "install", "ln", "mkdir", "touch", "truncate",
+    # network and editors: fetch to disk, or open what you point at
+    "curl", "wget", "git", "code", "notepad", "vim", "nano", "explorer", "open",
+})
+
 import os
 import re
 from pathlib import Path
@@ -86,7 +102,12 @@ class Config:
         self.root = Path(root) if root else self.config_path.resolve().parent
         self.warnings: list[str] = []
         self._runtime_overrides: dict[str, Any] = {}
-        self.validate()
+        # KEEP the result. This used to call validate() and throw the list away,
+        # so every config warning was dead: main.py printed nothing at startup,
+        # the self-test's config check extended an empty list, and the README's
+        # promise that --check warns about an enabled cloud fallback (or a bad
+        # personality, or an empty allowlist) simply did not happen.
+        self.warnings = self.validate()
 
     # -- construction ------------------------------------------------------
     @classmethod
@@ -134,6 +155,11 @@ class Config:
         comments, which are the documentation.
         """
         self._runtime_overrides[dotted] = value
+        # Re-check: a runtime change can introduce (or clear) a warning - enabling
+        # cloud fallback without the key, emptying an allowlist, --model pointing
+        # at a missing file. Warnings that only describe the file on disk would be
+        # wrong the moment anything is overridden.
+        self.warnings = self.validate()
 
     def section(self, name: str) -> dict[str, Any]:
         value = self.data.get(name)
@@ -250,6 +276,23 @@ class Config:
         prompt_rel = str(self.get("brain.system_prompt", ""))
         if prompt_rel and not self.resolve_path(prompt_rel).exists():
             warnings.append(f"System prompt file not found: {self.resolve_path(prompt_rel)}")
+
+        # The shell allowlist is a *separate, weaker* boundary than the file
+        # allowlists, and the difference is not obvious: `cat` and `python3` are
+        # programs, so once they may run they can reach anything the user's
+        # account can, whatever files.allowed_read/write say. Say so every time
+        # the config is checked, with the fix, instead of leaving it implied.
+        runnable = {str(name).lower() for name in self.shell_allowlist()}
+        file_capable = sorted(runnable & _FILE_CAPABLE_PROGRAMS)
+        if file_capable and bool(self.get("shell.require_allowlist", True)):
+            warnings.append(
+                "shell.allowlist includes programs that can read and write files themselves ("
+                + ", ".join(file_capable)
+                + "), so files.allowed_read/allowed_write do not bound the shell: `cat /anywhere` "
+                "or `python3 -c ...` can reach whatever your user account can. The file tools keep "
+                "their own checks either way. Remove those programs from shell.allowlist if you "
+                "need the folders to be a hard boundary."
+            )
 
         if not self.get("files.allowed_read"):
             warnings.append("files.allowed_read is empty: file reads will all be denied.")

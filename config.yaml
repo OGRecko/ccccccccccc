@@ -163,6 +163,15 @@ permissions:
     always_show_exact_args: true   # show the full command/path/URL being confirmed
   spoken_denials: true         # GARVIS says "denied" out loud
   log_every_decision: true
+  # After a state-changing action succeeds, check the end state and put what was
+  # found into the answer ("notes.txt exists (412 bytes)"). A bad check turns the
+  # result into a failure so a tool cannot claim it did something it did not do.
+  #   files.write/append/mkdir -> the path is re-read and must be there
+  #   files.copy/move/delete   -> the destination must be there, the source gone
+  #   GUI/browser/screen tools -> a screenshot (services["verifier"], stage 7)
+  # When nothing at all can be re-checked, the model is told so in the result
+  # instead of being left to assume success; set false to drop that reminder.
+  note_unverified: true
 
 # ---------------------------------------------------------------------------
 # ALLOWLISTS - tools may only touch what is listed here (stage 3/4/6)
@@ -316,6 +325,14 @@ logging:
   console: true
   activity_log: logs/activity_log.txt   # required human-readable audit trail
   activity_jsonl: logs/activity_log.jsonl  # machine-readable twin ("what did you do today")
+  # What a tool result becomes in the activity log: one redacted line, capped at
+  # this many characters. The log is an audit trail, not a copy of your files -
+  # the full content still goes to the model and to you, but a password on line
+  # 40 of a file, or halfway down a command's output, can never be logged.
+  result_max_chars: 400
+  # Extra patterns for this machine, on top of the built-in ones (credential
+  # keywords in "key = value" and "the token is ..." form, SSN/card shapes,
+  # GitHub/Slack/OpenAI/AWS key shapes, private key blocks).
   redact_patterns:               # never written to any log file
     - "(?i)(password|passwd|pwd|secret|token|api[_-]?key|bearer)\\s*[:=]\\s*\\S+"
     - "(?i)card\\s*(number|no\\.?)\\s*[:=]?\\s*[0-9][0-9 \\-]{10,}"

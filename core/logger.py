@@ -38,7 +38,20 @@ from typing import Any, Callable, Iterable
 # a path name, or a model's own output before it hits a log file.
 # --------------------------------------------------------------------------
 
+# Always applied, whatever is in config.yaml: a user who removes the patterns
+# from their config must not lose the protection. config patterns are added on
+# top of these.
+#
+# Credential keywords, both "key = value" and how people actually write it
+# ("the token is ...", "my pin was 4321"). Deliberately over-eager: a redacted
+# line in a log is cosmetic, a logged credential is not.
+_CREDENTIAL_WORDS = (
+    r"password|passwd|pwd|passcode|passphrase|secret|token|api[_-]?key|apikey|"
+    r"bearer|authorization|otp|totp|cvv|cvc|pin|access[_-]?key|client[_-]?secret|"
+    r"recovery[_-]?code|seed[_-]?phrase|private[_-]?key"
+)
 DEFAULT_REDACT_PATTERNS: tuple[str, ...] = (
+    rf"(?i)\b({_CREDENTIAL_WORDS})\b\s*(?:[:=]|\bis\b|\bwas\b|\bwere\b|\bare\b)\s*[\"']?\S+",
     r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|apikey|bearer|authorization)\b\s*[:=]\s*\S+",
     # JSON-ish forms, e.g. {"password": "hunter2"} or password: hunter2
     r'(?i)"?\b(password|passwd|pwd|secret|token|api[_-]?key|apikey|bearer|authorization|otp|totp|cvv)\b"?\s*[:=]\s*"?[^",}\s]+',  
@@ -46,7 +59,7 @@ DEFAULT_REDACT_PATTERNS: tuple[str, ...] = (
     r"\b(?:\d[ -]?){13,19}\b",                    # card-number shape
     r"(?i)\bcard\s*(number|no\.?)\b\s*[:=]?\s*[0-9][0-9 \-]{10,}",
     r"\bgh[pousr]_[A-Za-z0-9]{16,}\b",
-    r"\bsk-[A-Za-z0-9]{16,}\b",
+    r"\bsk-[A-Za-z0-9_-]{10,}\b",          # OpenAI-style, including sk-live-/sk-proj-
     r"\bAKIA[0-9A-Z]{16}\b",
     r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
@@ -152,6 +165,7 @@ class ActivityLogger:
         log_dir: Path,
         activity_log_name: str = "activity_log.txt",
         activity_jsonl_prefix: str = "activity_log",
+        result_max_chars: int = 400,
         redact_patterns: Iterable[str] | None = None,
         redaction_replacement: str = REDACTION_REPLACEMENT,
         enabled: bool = True,
@@ -161,6 +175,7 @@ class ActivityLogger:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.activity_path = self.dir / Path(activity_log_name).name
         self.jsonl_prefix = Path(activity_jsonl_prefix).stem
+        self.result_max_chars = max(80, int(result_max_chars))
         self.redactor = Redactor(redact_patterns, redaction_replacement)
         self._lock = threading.RLock()
         self._sub_lock = threading.RLock()
@@ -199,6 +214,29 @@ class ActivityLogger:
                 continue  # a bad listener is not allowed to lose a log line
 
     # -- writing -----------------------------------------------------------
+    def _loggable_result(self, text: str) -> str:
+        """What a tool result becomes in the log: one redacted line, capped.
+
+        The activity log is an audit trail - what was done, and whether it
+        worked - not a copy of your files or your command output. So a result
+        body is reduced to its first line (redacted, then capped): a password on
+        line 40 of a file that was read, or halfway down `git log`, can never
+        reach the log, whichever phrasing it uses. The full content still goes
+        to the model and to the user; only the log is bounded.
+        """
+        redacted = self.redactor(text)
+        first = ""
+        for line in redacted.splitlines():
+            if line.strip():
+                first = line.strip()
+                break
+        if len(first) > self.result_max_chars:
+            first = first[: self.result_max_chars].rstrip() + "..."
+        withheld = len(redacted) - len(first)
+        if withheld > 0:
+            first += f"  (+{withheld} more characters not written to this log)"
+        return first
+
     def event(
         self,
         kind: str,
@@ -230,7 +268,7 @@ class ActivityLogger:
         if account:
             record["account"] = account
         if result is not None:
-            record["result"] = _truncate(self.redactor(result))
+            record["result"] = self._loggable_result(result)
         if ok is not None:
             record["ok"] = bool(ok)
         if duration_ms is not None:
@@ -495,6 +533,7 @@ def configure_activity_logger(cfg: "Any") -> ActivityLogger:
         log_dir=log_dir,
         activity_log_name=Path(str(cfg.get("logging.activity_log", "logs/activity_log.txt"))).name,
         activity_jsonl_prefix=Path(str(cfg.get("logging.activity_jsonl", "logs/activity_log.jsonl"))).stem,
+        result_max_chars=int(cfg.get("logging.result_max_chars", 400) or 400),
         redact_patterns=cfg.get("logging.redact_patterns", []),
         redaction_replacement=str(cfg.get("logging.redaction_replacement", REDACTION_REPLACEMENT)),
         enabled=True,

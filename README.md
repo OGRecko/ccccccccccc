@@ -397,6 +397,13 @@ Rules the code enforces, not the prompt:
 - **Passwords.** Never typed, never read, never logged. GARVIS refuses
   credential-looking fields and values, and the refusal happens before any
   confirmation is requested.
+- **Nothing replaces a file on one "yes".** Creating a file and appending to one
+  are ordinary YELLOW actions; *replacing* an existing file is RED — the same
+  treatment `files.move` and `files.copy` have always given an existing target,
+  because the old contents are gone for good. The promotion is a guard in the
+  gate, not a flag in the tool: `confirm=true` is chosen by the model, so it
+  cannot be what decides how much scrutiny a write gets. A model that does not
+  acknowledge the overwrite gets a plain refusal telling it to append instead.
 - **Human takeover.** CAPTCHA, 2FA prompts, "verify you are human" and bot walls
   are detected and stop automation for that profile until you finish and say
   "continue".
@@ -575,7 +582,7 @@ root.
 ## Tests and demos
 
 ```bash
-.venv/bin/pytest tests/ -q                 # the full suite: 532 passed, 1 skipped (~105 s)
+.venv/bin/pytest tests/ -q                 # the full suite: 545 passed, 1 skipped (~105 s)
 .venv/bin/pytest tests/test_stage3_permissions.py -v   # one stage
 ```
 
@@ -593,6 +600,11 @@ the *guarantees* rather than the features:
   bomb client (nothing constructs one), that a missing key stays local, that a
   fallback turn cannot act without `allow_tools`, and that the API key never
   reaches a log.
+- `tests/test_overwrite_guards.py` tries to destroy a file with the weakest
+  approval there is (a user who says "yes" to everything) through all three
+  clobbering tools, and checks the file survives — then checks that appending,
+  creating and `create_only` still cost one question, and that the honest
+  repeat-plus-confirm path still overwrites successfully.
 - `tests/test_breaker_recovery.py` trips the consecutive-failure breaker and
   checks both halves of the promise: it holds for the whole turn (a failing tool
   is not called again), and a user's message — and only a user's message — brings

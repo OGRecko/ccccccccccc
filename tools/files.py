@@ -260,8 +260,11 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
     @registry.tool(
         name="files.write",
         description=(
-            "Create or overwrite a text file inside the allowed write folders. Say what you are "
-            "writing and where: this needs the user's approval before it runs."
+            "Create a text file inside the allowed write folders, append to one, or replace one. "
+            "Say what you are writing and where: this needs the user's approval before it runs, "
+            "and replacing an existing file is a RED action (the user repeats the exact action "
+            "and says the confirm word), because the old contents are gone for good. Prefer "
+            "mode='append' when adding to a file."
         ),
         parameters={
             "type": "object",
@@ -285,6 +288,23 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         path_args=("path",),
         path_base="sandbox",
         spoken_action=lambda a: f"write the file {a.get('path', '')}",
+        # Replacing a file destroys what was in it, and nothing brings it back -
+        # the same category as files.move onto an existing target, which has
+        # always been RED. A one-word "yes" is not enough for that, however the
+        # request was phrased: the acknowledgement flag (confirm=true) is chosen
+        # by the model, so it cannot be what decides how much scrutiny a write
+        # gets. Append and create_only are untouched: they cannot lose data.
+        guard=lambda args: (
+            (
+                RED,
+                "would replace an existing file: pass confirm=true and approve the RED step",
+            )
+            if str(args.get("mode", "overwrite")).lower() == "overwrite"
+            and bool(args.get("confirm"))
+            and str(args.get("path", "")).strip()
+            and resolve(str(args["path"])).is_file()
+            else (None, "")
+        ),
         example="files.write(path='notes/todo.md', text='- ship it', mode='append')",
     )
     def files_write(path: str, text: str, mode: str = "overwrite", confirm: bool = False) -> ToolResult:
@@ -295,10 +315,13 @@ def register(registry: ToolRegistry, cfg: Any, log: Any = None, services: dict[s
         if target.exists() and mode == "create_only":
             return ToolResult.failure(f"{target} already exists and mode=create_only was requested.")
         if target.exists() and mode == "overwrite" and not confirm:
-            # Not fatal: the gate already showed the user the exact path and text.
+            # Not fatal, and deliberately not a prompt: nothing will be lost until
+            # the model asks again with confirm=true, which the gate treats as the
+            # destructive action it is (RED: repeat the exact action, then confirm).
             return ToolResult.failure(
-                f"{target} already exists. Re-issue with confirm=true (and check you are not "
-                f"clobbering something you wanted)."
+                f"{target} already exists, and replacing it cannot be undone. Re-issue with "
+                f"confirm=true if that is really the intent - you will be asked to repeat the "
+                f"action and say the confirm word. Use mode='append' to add to it instead."
             )
         try:
             target.parent.mkdir(parents=True, exist_ok=True)

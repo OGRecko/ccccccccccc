@@ -156,8 +156,11 @@ def main() -> int:
                 print(f"  permission  {record.get('decision'):<10} {record.get('tier'):<6} "
                       f"{record.get('tool')}  {record.get('note', '')[:70]}")
             elif record.get("kind") == "tool":
+                # "has a result" is not the same as "was checked afterwards":
+                # say which one this is, so the demo cannot be read as a claim
+                # that a refused call was verified.
                 print(f"  tool        {'ok' if record.get('ok') else 'failed':<10} "
-                      f"{record.get('tool')}  verified={bool(record.get('result'))}")
+                      f"{record.get('tool')}  {'has a result' if record.get('result') else 'no result'}")
 
         print("\n--- sandbox now contains ---")
         for entry in sorted(sandbox.iterdir()):

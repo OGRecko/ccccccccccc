@@ -474,6 +474,15 @@ Rules the code enforces, not the prompt:
   pretending the command finished. What it cannot do: un-run something already
   finished, or cancel a call already inside a third-party function (a
   screenshot backend, a Playwright action) — those end when that call returns.
+  While it is engaged, **new work is refused twice over**: the gate declines
+  every tool call (`stopped: the kill switch is engaged…`), so a UI button, a
+  worker thread or a future caller cannot quietly run something after the stop,
+  and text from a frozen session never reaches the model at all — it gets
+  "I am stopped. Say 'resume' when you want me to carry on." Saying **resume**
+  (the tray item, the hotkey, or the word) is the only way back, and it is
+  recorded in the audit trail like every other decision. A call abandoned at its
+  timeout whose command is still running stays registered with the switch, so a
+  later STOP kills that too — tested end to end in `tests/test_abandoned_work.py`.
 
 Logs: everything is appended to `logs/activity_log.txt` (human-readable) and
 `logs/activity_log-YYYY-MM-DD.jsonl` (machine-readable), with credentials
@@ -596,7 +605,7 @@ root.
 ## Tests and demos
 
 ```bash
-.venv/bin/pytest tests/ -q                 # the full suite: 583 passed, 1 skipped (~105 s)
+.venv/bin/pytest tests/ -q                 # the full suite: 593 passed, 1 skipped (~120 s)
 .venv/bin/pytest tests/test_stage3_permissions.py -v   # one stage
 ```
 
@@ -614,6 +623,9 @@ the *guarantees* rather than the features:
   bomb client (nothing constructs one), that a missing key stays local, that a
   fallback turn cannot act without `allow_tools`, and that the API key never
   reaches a log.
+- `tests/test_abandoned_work.py` covers the two features that had to compose: a
+  call abandoned at its timeout, whose command is still running — STOP must kill
+  it — and a call arriving *while* stopped, which must never start anything.
 - `tests/test_shell_paths.py` walks the shell around the allowlists (`cat` on a
   file inside no allowlist) and pins the *stated* boundary: keys, cookie stores
   and GARVIS's own files are refused through every phrasing tried, ordinary work
